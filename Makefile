@@ -1,86 +1,60 @@
-.PHONY: clean clean-env check quality style tag-version test env upload upload-test
+.PHONY: audit check clean clean-env format format-check init lint package-check test test-% types update
 
-PROJECT=project
-QUALITY_DIRS=$(PROJECT) tests
-CLEAN_DIRS=$(PROJECT) tests
-PYTHON=uv run python
+SOURCES = project scripts tests
+UV = uv
 
-check: ## run quality checks and unit tests
-	$(MAKE) style
-	$(MAKE) quality
-	$(MAKE) types
-	$(MAKE) test
+format: ## rewrite Python files with Ruff formatting
+	$(UV) run --frozen ruff format $(SOURCES)
 
-clean: ## remove cache files
-	find $(CLEAN_DIRS) -path '*/__pycache__/*' -delete
-	find $(CLEAN_DIRS) -type d -name '__pycache__' -empty -delete
-	find $(CLEAN_DIRS) -name '*@neomake*' -type f -delete
-	find $(CLEAN_DIRS) -name '*.pyc' -type f -delete
-	find $(CLEAN_DIRS) -name '*,cover' -type f -delete
-	find $(CLEAN_DIRS) -name '*.orig' -type f -delete
+format-check: ## verify formatting without rewriting files
+	$(UV) run --frozen ruff format --check $(SOURCES)
 
-clean-env: ## remove the virtual environment directory
+lint: ## run Ruff lint checks
+	$(UV) run --frozen ruff check $(SOURCES)
+
+types: ## run Basedpyright type checking
+	$(UV) run --frozen basedpyright
+
+test: ## run tests with branch coverage and the 90 percent threshold
+	$(UV) run --frozen pytest \
+		--cov=project \
+		--cov-report=term-missing \
+		--cov-report=xml \
+		tests
+
+test-%: ## run tests matching a pattern
+	$(UV) run --frozen pytest -k $* tests
+
+audit: ## scan all locked dependency groups for known advisories
+	audit_requirements="$$(mktemp)"; \
+		trap 'rm -f "$$audit_requirements"' EXIT; \
+		$(UV) export --quiet --frozen --all-groups --no-hashes --no-emit-project \
+			--format requirements-txt --output-file "$$audit_requirements"; \
+		$(UV) run --frozen pip-audit --disable-pip --no-deps \
+			--progress-spinner off -r "$$audit_requirements"
+
+check: format-check lint types test audit ## run all non-rewriting quality gates
+
+package-check: ## build a wheel and import it in an isolated environment
+	$(UV) build --no-sources
+	wheel="$$(find dist -name '*.whl' -print -quit)"; \
+		test -n "$$wheel"; \
+		$(UV) run --isolated --no-project --with "$$wheel" python -c "import project"
+
+init: ## install all locked dependency groups
+	$(UV) sync --frozen --all-groups
+
+update: ## refresh the lockfile and local environment
+	$(UV) lock --upgrade
+	$(UV) sync --all-groups
+
+clean: ## remove local Python and quality-tool caches
+	find $(SOURCES) -type d -name '__pycache__' -prune -exec rm -r {} +
+	rm -rf .pytest_cache .ruff_cache htmlcov
+	rm -f .coverage coverage.xml
+
+clean-env: ## remove the local virtual environment
 	rm -rf .venv
 
-
-deploy: ## installs from lockfile
-	git submodule update --init --recursive
-	which uv || pip install --user uv
-	uv sync --frozen --no-dev
-
-
-init: ## pulls submodules and initializes virtual environment
-	git submodule update --init --recursive
-	which uv || pip install --user uv
-	uv sync --all-groups --all-extras
-
-node_modules: 
-ifeq (, $(shell which npm))
-	$(error "No npm in $(PATH), please install it to run pyright type checking")
-else
-	npm install
-endif
-
-quality:
-	$(MAKE) clean
-	$(PYTHON) -m black --check $(QUALITY_DIRS)
-	$(PYTHON) -m autopep8 -a $(QUALITY_DIRS)
-
-style:
-	$(PYTHON) -m autoflake -r -i $(QUALITY_DIRS)
-	$(PYTHON) -m isort $(QUALITY_DIRS)
-	$(PYTHON) -m autopep8 -a $(QUALITY_DIRS)
-	$(PYTHON) -m black $(QUALITY_DIRS)
-
-test: ## run unit tests
-	$(PYTHON) -m pytest \
-		-rs \
-		--cov=./$(PROJECT) \
-		--cov-report=term \
-		./tests/
-
-test-%: ## run unit tests matching a pattern
-	$(PYTHON) -m pytest -s -r fE -k $* ./tests/ --tb=no
-
-test-pdb-%: ## run unit tests matching a pattern with PDB fallback
-	$(PYTHON) -m pytest -rs --pdb -k $* -v ./tests/ 
-
-test-ci: ## runs CI-only tests
-	export "CUDA_VISIBLE_DEVICES=''" && \
-	$(PYTHON) -m pytest \
-		-rs \
-		-m "not ci_skip" \
-		--cov=./$(PROJECT) \
-		--cov-report=xml \
-		--cov-report=term \
-		./tests/
-
-types:
-	uv run pyright
-
-update:
-	uv sync --all-groups --all-extras
-
-help: ## display this help message
-	@echo "Please use \`make <target>' where <target> is one of"
-	@perl -nle'print $& if m{^[a-zA-Z_-]+:.*?## .*$$}' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m  %-25s\033[0m %s\n", $$1, $$2}'
+help: ## list available recipes
+	@awk 'BEGIN {FS = ":.*?## "}; /^[a-zA-Z_-]+:.*?## / {printf "\033[36m  %-25s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST) | sort

@@ -1,7 +1,7 @@
 [build-system]
 requires = [
-    "hatchling",
-    "hatch-vcs",
+    "hatchling==1.31.0",
+    "hatch-vcs==0.5.0",
 ]
 build-backend = "hatchling.build"
 
@@ -12,7 +12,11 @@ requires-python = ">=3.12"
 authors = [
     { name = "Scott Chase Waggener", email = "chase.waggener@icloud.com" },
 ]
-dependencies = []
+dependencies = [
+    "filelock==3.31.1",
+    "pyyaml==6.0.3",
+    "websockets==16.1.1",
+]
 readme = "README.md"
 dynamic = [
     "version",
@@ -20,18 +24,12 @@ dynamic = [
 
 [dependency-groups]
 dev = [
-    "autoflake",
-    "autopep8",
-    "black",
-    "flake8",
-    "isort",
-    "pyright",
-    "pytest",
-    "pytest-mock",
-    "pytest-cov",
-    "pytest-env",
-    "coverage",
-    "pdbpp",
+    "basedpyright==1.39.9",
+    "pip-audit==2.10.1",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-mock==3.15.1",
+    "ruff==0.15.22",
 ]
 
 [project.license]
@@ -39,40 +37,10 @@ text = "Apache"
 
 [project.optional-dependencies]
 
-[tool.autoflake]
-remove-all-unused-imports = true
-remove-unused-variables = true
-exclude = [
-    "**/_version.py",
-]
-
-[tool.autopep8]
-max_line_length = 120
-ignore = "E501,W6,E203"
-in-place = true
-recursive = true
-aggressive = 3
-exclude = "**/_version.py"
-
-[tool.black]
-line-length = 120
-extend-exclude = "_version.py"
-
-[tool.isort]
-ensure_newline_before_comments = true
-force_grid_wrap = 0
-include_trailing_comma = true
-line_length = 119
-lines_after_imports = 2
-multi_line_output = 3
-use_parentheses = false
-skip_glob = [
-    "**/_version.py",
-]
-
-[tool.pyright]
+[tool.basedpyright]
 include = [
     "project",
+    "scripts",
     "tests",
 ]
 exclude = [
@@ -81,17 +49,55 @@ exclude = [
     "**/.pytest_cache",
     "**/_version.py",
 ]
-ignore = [
-    "src/oldstuff",
-]
-pythonVersion = "3.14"
+pythonVersion = "3.12"
 pythonPlatform = "Linux"
+typeCheckingMode = "standard"
+
+[tool.coverage.run]
+branch = true
+source = [
+    "project",
+]
+omit = [
+    "project/_version.py",
+]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "project/_version.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "B",
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "RUF",
+    "SIM",
+    "UP",
+]
 
 [tool.pytest.ini_options]
+testpaths = [
+    "tests",
+]
 markers = [
     "ci_skip",
 ]
 filterwarnings = []
+
+[tool.uv]
+required-version = "==0.11.28"
 
 [tool.hatch.version]
 source = "vcs"

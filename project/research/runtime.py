@@ -6,6 +6,7 @@ terminal run result because notification delivery failed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,16 @@ IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TERMINAL_STATUSES = frozenset({"completed", "failed", "crashed", "timed_out", "cancelled"})
 DELIVERY_STATES = frozenset({"pending", "accepted", "failed"})
 MAX_LAST_ERROR_LENGTH = 500
+MANAGED_ROOT_SCHEMA_VERSION = 1
+MANAGED_ROOT_FILE_NAME = ".autoresearch-root.json"
+MANAGED_ROOT_KIND = "autoresearch-managed-root"
+MANAGED_ROOT_FIELDS = frozenset({"schema_version", "kind", "root_path"})
+RESEARCH_LOG_SCHEMA_VERSION = 1
+RESEARCH_LOG_MARKER_PREFIX = "<!-- autoresearch-log "
+RESEARCH_LOG_MARKER_SUFFIX = " -->"
+RESEARCH_LOG_METADATA_FIELDS = frozenset(
+    {"schema_version", "kind", "operation_id", "content_sha256", "terminal"}
+)
 
 TerminalStatus = Literal["completed", "failed", "crashed", "timed_out", "cancelled"]
 DeliveryState = Literal["pending", "accepted", "failed"]
@@ -34,6 +45,22 @@ DeliveryState = Literal["pending", "accepted", "failed"]
 
 class StateValidationError(ValueError):
     """Persisted or requested research state violates the schema or path contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedRootRegistration:
+    """Result of idempotently registering one exact managed root."""
+
+    root: Path
+    marker: Path
+    created: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "created": self.created,
+            "marker": str(self.marker),
+            "root": str(self.root),
+        }
 
 
 def _validate_identifier(value: object, field_name: str) -> str:
@@ -68,6 +95,36 @@ def _validate_attempt(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise StateValidationError("attempt must be a positive integer")
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalLogIdentity:
+    """Stable identity for one terminal run attempt in the research log."""
+
+    study_id: str
+    run_id: str
+    attempt: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "study_id", _validate_identifier(self.study_id, "study id"))
+        object.__setattr__(self, "run_id", _validate_identifier(self.run_id, "run id"))
+        object.__setattr__(self, "attempt", _validate_attempt(self.attempt))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "attempt": self.attempt,
+            "run_id": self.run_id,
+            "study_id": self.study_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _ResearchLogRecord:
+    kind: Literal["header", "entry"]
+    operation_id: str
+    content_sha256: str
+    terminal: TerminalLogIdentity | None
+    markdown: str
 
 
 def _normalize_utc(value: datetime, field_name: str) -> datetime:
@@ -120,6 +177,40 @@ def _resolved_managed_path(path: Path, managed_root: Path, field_name: str) -> P
     if resolved == root or not resolved.is_relative_to(root):
         raise StateValidationError(f"{field_name} must remain inside the managed root {root}")
     return resolved
+
+
+def _lexical_absolute(path: Path) -> Path:
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _validated_root_target(root: Path) -> Path:
+    lexical = _lexical_absolute(root)
+    resolved = lexical.resolve(strict=False)
+    if lexical != resolved:
+        raise StateValidationError("managed root must not contain symlink path components")
+    if resolved == Path(resolved.anchor):
+        raise StateValidationError("managed root must not be a filesystem root")
+    if resolved.parent == Path(resolved.anchor):
+        raise StateValidationError("managed root must not be a top-level directory")
+
+    home = Path.home().resolve(strict=False)
+    if resolved == home or home.is_relative_to(resolved):
+        raise StateValidationError("managed root must not be a home directory or its parent")
+
+    current = Path.cwd().resolve(strict=False)
+    if resolved == current or current.is_relative_to(resolved):
+        if (resolved / ".git").exists():
+            raise StateValidationError("managed root must not be a repository root")
+        raise StateValidationError("managed root must not be a broad working-directory parent")
+    if (resolved / ".git").exists():
+        raise StateValidationError("managed root must not be a repository root")
+    if resolved.exists() and not resolved.is_dir():
+        raise StateValidationError("managed root must be a directory")
+    return resolved
+
+
+def _managed_root_marker(root: Path) -> Path:
+    return root / MANAGED_ROOT_FILE_NAME
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +650,260 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
+def validate_managed_root(root: Path) -> Path:
+    """Return the canonical root after validating its exact registration marker."""
+
+    resolved = _validated_root_target(root)
+    if not resolved.exists():
+        raise StateValidationError(f"managed root does not exist: {resolved}")
+    marker = _managed_root_marker(resolved)
+    if marker.is_symlink():
+        raise StateValidationError("managed-root marker must not be a symlink")
+    if not marker.exists():
+        raise StateValidationError(f"managed root is not registered: {resolved}")
+    if not marker.is_file():
+        raise StateValidationError(f"managed-root marker must be a file: {marker}")
+    payload = _load_json(marker)
+    _require_keys(payload, MANAGED_ROOT_FIELDS, marker)
+    schema_version = payload["schema_version"]
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != MANAGED_ROOT_SCHEMA_VERSION
+    ):
+        raise StateValidationError(f"unsupported managed-root schema version: {schema_version!r}")
+    if payload["kind"] != MANAGED_ROOT_KIND:
+        raise StateValidationError(f"invalid managed-root marker kind: {payload['kind']!r}")
+    if payload["root_path"] != str(resolved):
+        raise StateValidationError("managed-root marker does not identify the exact root")
+    return resolved
+
+
+def register_managed_root(root: Path) -> ManagedRootRegistration:
+    """Atomically register one safe root without scanning or replacing its contents."""
+
+    resolved = _validated_root_target(root)
+    resolved.mkdir(parents=True, exist_ok=True)
+    resolved = _validated_root_target(resolved)
+    marker = _managed_root_marker(resolved)
+    if marker.is_symlink():
+        raise StateValidationError("managed-root marker must not be a symlink")
+    if marker.exists():
+        validate_managed_root(resolved)
+        return ManagedRootRegistration(root=resolved, marker=marker, created=False)
+    _atomic_write_json(
+        marker,
+        {
+            "schema_version": MANAGED_ROOT_SCHEMA_VERSION,
+            "kind": MANAGED_ROOT_KIND,
+            "root_path": str(resolved),
+        },
+    )
+    return ManagedRootRegistration(root=resolved, marker=marker, created=True)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace UTF-8 text through a synced same-directory file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _normalize_markdown(markdown: str, field_name: str) -> str:
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise StateValidationError(f"{field_name} must be non-empty Markdown")
+    if RESEARCH_LOG_MARKER_PREFIX in markdown:
+        raise StateValidationError(f"{field_name} contains reserved metadata")
+    return f"{markdown.rstrip()}\n"
+
+
+def _research_log_marker(
+    *,
+    kind: Literal["header", "entry"],
+    operation_id: str,
+    markdown: str,
+    terminal: TerminalLogIdentity | None,
+) -> str:
+    metadata = {
+        "schema_version": RESEARCH_LOG_SCHEMA_VERSION,
+        "kind": kind,
+        "operation_id": operation_id,
+        "content_sha256": hashlib.sha256(markdown.encode()).hexdigest(),
+        "terminal": None if terminal is None else terminal.to_dict(),
+    }
+    encoded = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+    return f"{RESEARCH_LOG_MARKER_PREFIX}{encoded}{RESEARCH_LOG_MARKER_SUFFIX}"
+
+
+def _parse_terminal_log_identity(value: object, source: Path) -> TerminalLogIdentity | None:
+    if value is None:
+        return None
+    payload = _require_mapping(value, source)
+    _require_keys(payload, frozenset({"study_id", "run_id", "attempt"}), source)
+    return TerminalLogIdentity(
+        study_id=payload["study_id"],
+        run_id=payload["run_id"],
+        attempt=payload["attempt"],
+    )
+
+
+def _parse_research_log(log_path: Path, content: str) -> list[_ResearchLogRecord]:
+    lines = content.splitlines(keepends=True)
+    marker_indices = [
+        index for index, line in enumerate(lines) if line.startswith(RESEARCH_LOG_MARKER_PREFIX)
+    ]
+    if not marker_indices or marker_indices[0] != 0:
+        raise StateValidationError(f"research log metadata is missing or misplaced: {log_path}")
+    records: list[_ResearchLogRecord] = []
+    for position, marker_index in enumerate(marker_indices):
+        marker_line = lines[marker_index].removesuffix("\n")
+        if not marker_line.endswith(RESEARCH_LOG_MARKER_SUFFIX):
+            raise StateValidationError(f"research log metadata is malformed: {log_path}")
+        encoded = marker_line[len(RESEARCH_LOG_MARKER_PREFIX) : -len(RESEARCH_LOG_MARKER_SUFFIX)]
+        try:
+            raw_metadata = json.loads(encoded)
+        except json.JSONDecodeError as error:
+            raise StateValidationError(f"research log metadata is malformed: {error}") from error
+        metadata = _require_mapping(raw_metadata, log_path)
+        _require_keys(metadata, RESEARCH_LOG_METADATA_FIELDS, log_path)
+        if metadata["schema_version"] != RESEARCH_LOG_SCHEMA_VERSION:
+            raise StateValidationError(
+                f"unsupported research-log schema version: {metadata['schema_version']!r}"
+            )
+        kind = metadata["kind"]
+        if kind not in {"header", "entry"}:
+            raise StateValidationError(f"invalid research-log record kind: {kind!r}")
+        operation_id = _validate_identifier(metadata["operation_id"], "operation id")
+        digest = metadata["content_sha256"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise StateValidationError("research-log content digest is invalid")
+        body_end = (
+            marker_indices[position + 1] if position + 1 < len(marker_indices) else len(lines)
+        )
+        body = "".join(lines[marker_index + 1 : body_end])
+        if not body.endswith("\n\n"):
+            raise StateValidationError("research-log record is not a complete Markdown block")
+        markdown = body[:-1]
+        if hashlib.sha256(markdown.encode()).hexdigest() != digest:
+            raise StateValidationError("research-log record content does not match its metadata")
+        records.append(
+            _ResearchLogRecord(
+                kind=cast(Literal["header", "entry"], kind),
+                operation_id=operation_id,
+                content_sha256=digest,
+                terminal=_parse_terminal_log_identity(metadata["terminal"], log_path),
+                markdown=markdown,
+            )
+        )
+    if records[0].kind != "header" or any(record.kind == "header" for record in records[1:]):
+        raise StateValidationError("research log must contain exactly one leading header")
+    return records
+
+
+def _render_research_log_record(
+    *,
+    kind: Literal["header", "entry"],
+    operation_id: str,
+    markdown: str,
+    terminal: TerminalLogIdentity | None,
+) -> str:
+    marker = _research_log_marker(
+        kind=kind,
+        operation_id=operation_id,
+        markdown=markdown,
+        terminal=terminal,
+    )
+    return f"{marker}\n{markdown}\n"
+
+
+def append_research_log(
+    log_path: Path,
+    *,
+    managed_root: Path,
+    header_operation_id: str,
+    header_markdown: str,
+    operation_id: str,
+    markdown: str,
+    terminal: TerminalLogIdentity | None = None,
+) -> bool:
+    """Append one complete Markdown update under a stable sibling lock.
+
+    Return ``False`` when the operation or terminal attempt is already present.
+    """
+
+    resolved_path = _resolved_managed_path(log_path.absolute(), managed_root, "research log path")
+    normalized_header = _normalize_markdown(header_markdown, "header_markdown")
+    normalized_markdown = _normalize_markdown(markdown, "markdown")
+    validated_header_id = _validate_identifier(header_operation_id, "header operation id")
+    validated_operation_id = _validate_identifier(operation_id, "operation id")
+    if validated_header_id == validated_operation_id:
+        raise StateValidationError("header and entry operation IDs must differ")
+    lock_path = resolved_path.with_name(f".{resolved_path.name}.lock")
+    if lock_path.is_symlink():
+        raise StateValidationError("research-log lock must not be a symlink")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(lock_path)):
+        if resolved_path.exists():
+            try:
+                content = resolved_path.read_text(encoding="utf-8")
+            except UnicodeError as error:
+                raise StateValidationError(f"research log is not valid UTF-8: {error}") from error
+            records = _parse_research_log(resolved_path, content)
+            header = records[0]
+            expected_header_digest = hashlib.sha256(normalized_header.encode()).hexdigest()
+            if (
+                header.operation_id != validated_header_id
+                or header.content_sha256 != expected_header_digest
+                or header.terminal is not None
+            ):
+                raise StateValidationError("research log header differs from the requested header")
+        else:
+            content = _render_research_log_record(
+                kind="header",
+                operation_id=validated_header_id,
+                markdown=normalized_header,
+                terminal=None,
+            )
+            records = []
+
+        expected_digest = hashlib.sha256(normalized_markdown.encode()).hexdigest()
+        for record in records:
+            if record.operation_id == validated_operation_id:
+                if (
+                    record.kind == "entry"
+                    and record.content_sha256 == expected_digest
+                    and record.terminal == terminal
+                ):
+                    return False
+                raise StateValidationError(
+                    f"operation {validated_operation_id!r} already exists with different content"
+                )
+        if terminal is not None and any(record.terminal == terminal for record in records):
+            return False
+
+        content += _render_research_log_record(
+            kind="entry",
+            operation_id=validated_operation_id,
+            markdown=normalized_markdown,
+            terminal=terminal,
+        )
+        _atomic_write_text(resolved_path, content)
+        return True
+
+
 def read_terminal_event(path: Path, managed_root: Path) -> TerminalEvent:
     """Read and validate a terminal state file."""
 
@@ -580,8 +925,9 @@ def read_notification_event(
 def write_notification_event(event: NotificationEvent, managed_root: Path) -> None:
     """Persist notification delivery state without modifying terminal state."""
 
+    validated_root = validate_managed_root(managed_root)
     terminal_path = _resolved_managed_path(
-        Path(event.terminal_state_path), managed_root, "terminal_state_path"
+        Path(event.terminal_state_path), validated_root, "terminal_state_path"
     )
     _atomic_write_json(terminal_path.with_name(NOTIFICATION_FILE_NAME), event.to_dict())
 
@@ -630,6 +976,7 @@ def record_terminal_event(
     """
 
     validated_run = _validate_identifier(run_id, "run id")
+    register_managed_root(study.log_root)
     run_dir = study.run_dir(validated_run)
     run_dir.mkdir(parents=True, exist_ok=True)
     terminal_path = _resolved_managed_path(
@@ -682,6 +1029,7 @@ def ensure_notification(
 ) -> NotificationEvent:
     """Validate or reconstruct one run notification, optionally requeueing failure."""
 
+    validate_managed_root(study.log_root)
     run_dir = study.run_dir(run_id)
     terminal_path = run_dir / TERMINAL_FILE_NAME
     notification_path = run_dir / NOTIFICATION_FILE_NAME

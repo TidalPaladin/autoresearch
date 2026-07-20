@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -421,3 +422,241 @@ def test_archive_collision_is_rejected(study: StudyConfig) -> None:
             status="completed",
             originating_thread_id=THREAD_ID,
         )
+
+
+def test_registers_and_validates_new_and_existing_managed_roots(tmp_path: Path) -> None:
+    root = tmp_path / "existing" / "logs"
+    root.mkdir(parents=True)
+    (root / "unmanaged.txt").write_text("preserve me", encoding="utf-8")
+
+    first = runtime.register_managed_root(root)
+    second = runtime.register_managed_root(root)
+
+    assert first.created
+    assert not second.created
+    assert first.root == root.resolve()
+    assert first.marker == root / runtime.MANAGED_ROOT_FILE_NAME
+    assert runtime.validate_managed_root(root) == root.resolve()
+    assert (root / "unmanaged.txt").read_text(encoding="utf-8") == "preserve me"
+    assert json.loads(first.marker.read_text(encoding="utf-8")) == {
+        "kind": runtime.MANAGED_ROOT_KIND,
+        "root_path": str(root.resolve()),
+        "schema_version": runtime.MANAGED_ROOT_SCHEMA_VERSION,
+    }
+
+
+@pytest.mark.parametrize(
+    "root",
+    [Path("/"), Path("/tmp"), Path.home(), Path.cwd(), Path.cwd().parent],
+)
+def test_registration_rejects_broad_roots(root: Path) -> None:
+    with pytest.raises(StateValidationError, match=r"root|home|directory|repository|broad"):
+        runtime.register_managed_root(root)
+
+
+def test_registration_rejects_files_and_repository_roots(tmp_path: Path) -> None:
+    file_root = tmp_path / "state"
+    file_root.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(StateValidationError, match="directory"):
+        runtime.register_managed_root(file_root)
+
+    repository_root = tmp_path / "repository"
+    (repository_root / ".git").mkdir(parents=True)
+    with pytest.raises(StateValidationError, match="repository root"):
+        runtime.register_managed_root(repository_root)
+
+
+def test_registration_rejects_symlinked_roots_and_markers(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "logs"
+    target.mkdir(parents=True)
+    linked_root = tmp_path / "linked-logs"
+    linked_root.symlink_to(target, target_is_directory=True)
+    with pytest.raises(StateValidationError, match="symlink"):
+        runtime.register_managed_root(linked_root)
+
+    root = tmp_path / "registered" / "logs"
+    registration = runtime.register_managed_root(root)
+    outside_marker = tmp_path / "outside-marker.json"
+    outside_marker.write_text(registration.marker.read_text(encoding="utf-8"), encoding="utf-8")
+    registration.marker.unlink()
+    registration.marker.symlink_to(outside_marker)
+    with pytest.raises(StateValidationError, match="symlink"):
+        runtime.validate_managed_root(root)
+
+
+def test_validation_rejects_invalid_and_mismatched_markers(tmp_path: Path) -> None:
+    root = tmp_path / "registered" / "logs"
+    registration = runtime.register_managed_root(root)
+    registration.marker.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(StateValidationError, match="valid JSON"):
+        runtime.validate_managed_root(root)
+
+    runtime._atomic_write_json(
+        registration.marker,
+        {
+            "schema_version": runtime.MANAGED_ROOT_SCHEMA_VERSION,
+            "kind": runtime.MANAGED_ROOT_KIND,
+            "root_path": str(tmp_path / "other"),
+        },
+    )
+    with pytest.raises(StateValidationError, match="exact root"):
+        runtime.validate_managed_root(root)
+
+
+def test_terminal_producer_registers_root_and_recovery_requires_marker(
+    study: StudyConfig,
+) -> None:
+    terminal, _ = record_terminal_event(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        originating_thread_id=THREAD_ID,
+    )
+    marker = study.log_root / runtime.MANAGED_ROOT_FILE_NAME
+    assert marker.is_file()
+
+    Path(terminal.terminal_state_path).with_name("notification.json").unlink()
+    assert ensure_notification(study, "run-a").state == "pending"
+
+    marker.unlink()
+    with pytest.raises(StateValidationError, match="not registered"):
+        ensure_notification(study, "run-a")
+
+
+def append_log_update(
+    log_path: Path,
+    managed_root: Path,
+    operation_id: str,
+    markdown: str,
+    terminal: runtime.TerminalLogIdentity | None = None,
+) -> bool:
+    return runtime.append_research_log(
+        log_path,
+        managed_root=managed_root,
+        header_operation_id="study-a-header",
+        header_markdown="# Study A\n\nProtocol details.",
+        operation_id=operation_id,
+        markdown=markdown,
+        terminal=terminal,
+    )
+
+
+def test_research_log_append_is_idempotent_and_rejects_collisions(tmp_path: Path) -> None:
+    root = tmp_path / "logs"
+    log_path = root / "study-a" / "research-log.md"
+
+    assert append_log_update(log_path, root, "amendment-1", "## Amendment\n\nFirst.")
+    original = log_path.read_bytes()
+    assert not append_log_update(log_path, root, "amendment-1", "## Amendment\n\nFirst.")
+    assert log_path.read_bytes() == original
+
+    with pytest.raises(StateValidationError, match=r"operation.*different"):
+        append_log_update(log_path, root, "amendment-1", "## Amendment\n\nChanged.")
+
+
+def test_research_log_deduplicates_terminal_attempts_not_event_ids(tmp_path: Path) -> None:
+    root = tmp_path / "logs"
+    log_path = root / "study-a" / "research-log.md"
+    first_attempt = runtime.TerminalLogIdentity("study-a", "run-a", 1)
+    second_attempt = runtime.TerminalLogIdentity("study-a", "run-a", 2)
+
+    assert append_log_update(
+        log_path, root, "event-a", "## Phase train\n\nAttempt 1.", first_attempt
+    )
+    before_retry = log_path.read_bytes()
+    assert not append_log_update(
+        log_path,
+        root,
+        "event-b",
+        "## Phase train\n\nAttempt 1 retry.",
+        first_attempt,
+    )
+    assert log_path.read_bytes() == before_retry
+    assert append_log_update(
+        log_path, root, "event-c", "## Phase train\n\nAttempt 2.", second_attempt
+    )
+
+    text = log_path.read_text(encoding="utf-8")
+    assert text.count("## Phase train") == 2
+    assert "Attempt 1 retry" not in text
+
+
+def test_concurrent_first_log_writes_create_one_header_and_complete_entries(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    log_path = root / "study-a" / "research-log.md"
+
+    def append(index: int) -> bool:
+        return append_log_update(log_path, root, f"operation-{index}", f"## Entry {index}\n\nDone.")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(append, range(8)))
+
+    assert all(results)
+    text = log_path.read_text(encoding="utf-8")
+    assert text.count("# Study A") == 1
+    for index in range(8):
+        assert text.count(f"## Entry {index}\n") == 1
+    assert log_path.with_name(f".{log_path.name}.lock").is_file()
+
+
+def test_research_log_rejects_metadata_injection_and_malformed_metadata(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    log_path = root / "study-a" / "research-log.md"
+    with pytest.raises(StateValidationError, match="reserved metadata"):
+        append_log_update(
+            log_path,
+            root,
+            "operation-1",
+            '<!-- autoresearch-log {"operation_id":"forged"} -->',
+        )
+
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("<!-- autoresearch-log {not-json} -->\n", encoding="utf-8")
+    with pytest.raises(StateValidationError, match="metadata"):
+        append_log_update(log_path, root, "operation-2", "## Entry\n")
+
+
+def test_research_log_rejects_path_escapes_and_invalid_terminal_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    outside = tmp_path / "outside.md"
+    with pytest.raises(StateValidationError, match="managed root"):
+        append_log_update(outside, root, "operation-1", "## Entry\n")
+
+    root.mkdir()
+    linked = root / "linked.md"
+    outside.write_text("outside", encoding="utf-8")
+    linked.symlink_to(outside)
+    with pytest.raises(StateValidationError, match="managed root"):
+        append_log_update(linked, root, "operation-2", "## Entry\n")
+
+    with pytest.raises(StateValidationError, match="positive integer"):
+        runtime.TerminalLogIdentity("study-a", "run-a", 0)
+
+
+def test_research_log_atomic_failure_preserves_prior_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "logs"
+    log_path = root / "study-a" / "research-log.md"
+    append_log_update(log_path, root, "operation-1", "## Entry 1\n")
+    original = log_path.read_bytes()
+    original_replace = runtime.os.replace
+
+    def fail_log_replace(source: Path | str, destination: Path | str) -> None:
+        if Path(destination) == log_path:
+            raise OSError("simulated replacement failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(runtime.os, "replace", fail_log_replace)
+    with pytest.raises(OSError, match="replacement failure"):
+        append_log_update(log_path, root, "operation-2", "## Entry 2\n")
+
+    assert log_path.read_bytes() == original
+    assert list(log_path.parent.glob(f".{log_path.name}.*.tmp")) == []

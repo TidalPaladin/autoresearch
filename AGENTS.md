@@ -6,6 +6,7 @@ This repository is a reusable Python autoresearch template. Keep the generic `pr
 
 ## Autoresearch workflow
 
+- Treat `.agents/skills/autoresearch/` as the canonical skill source. The personal `~/.codex/skills/autoresearch` copy is deprecated and must not be edited as a source.
 - Read and use `.agents/skills/autoresearch/SKILL.md` for every empirical research study, experiment launch, recovery, comparison, or terminal-event workflow.
 - Require an active goal with study completion criteria before launching an experiment.
 - Recover existing state before creating or changing a study.
@@ -35,14 +36,23 @@ Use `uv==0.11.28`. Pin direct dependencies and commit `uv.lock`. Preserve Hatch 
 
 ## State safety
 
+- Register each existing research root explicitly with `scripts/research.py register-root --root <path>` before notification discovery. Producers register new roots automatically.
+- Require the exact atomic `.autoresearch-root.json` marker before scanning an existing root. Reject filesystem, home, repository, broad parent, malformed, and symlinked roots.
 - Write and sync `terminal.json` before `notification.json`.
 - Use same-directory atomic replacement, file and directory sync, and stable sibling locks.
 - Validate identifiers, schemas, timestamps, matching fields, absolute managed paths, and resolved symlink containment before acting.
 - Archive a different prior current event before replacement. Deduplicate retries by event ID.
+- Append shared Markdown research logs through the locked runtime helper. Deduplicate all updates by operation ID and terminal entries by study, run, and attempt.
 - Never delete unmanaged or historical experiment artifacts during autonomous work.
 - Keep generated state under `logs/research/` and out of Git.
 
 Notification failure must never change terminal training status. The runtime records terminal truth. Only notification delivery state can move between `pending`, `accepted`, and `failed`.
+
+## Adapter conformance
+
+- Define the exact destination and emitted data classes for every external-tracker operation. Permit an online write only when the destination and every emitted class are approved; otherwise keep the whole operation local and record the effective mode.
+- After spawning a child, own its process group until it is terminated and reaped. Perform this cleanup after every exceptional exit and before releasing GPU or other resource locks.
+- Advance a run's monitoring counters or `next_check_at` only when that run is due. A terminal wake must leave unrelated run counters and schedules unchanged and clear only the terminal run's poll.
 
 ## App-server ownership
 

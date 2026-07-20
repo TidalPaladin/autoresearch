@@ -18,10 +18,12 @@ from project.research.codex_notifications import (
     unix_connector,
 )
 from project.research.runtime import (
+    ManagedRootRegistration,
     NotificationEvent,
     StateValidationError,
     StudyConfig,
     ensure_notification,
+    register_managed_root,
 )
 
 OutputFormat = Literal["text", "json"]
@@ -79,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--transport", choices=("stdio", "unix"), default="stdio")
     worker.add_argument("--socket", type=Path, help="daemon Unix socket path")
     _add_output_arguments(worker)
+
+    register_root = commands.add_parser(
+        "register-root", help="register one exact root for notification discovery"
+    )
+    register_root.add_argument("--root", type=Path, required=True)
+    _add_output_arguments(register_root)
     return parser
 
 
@@ -161,11 +169,40 @@ def _render_sweep(result: SweepResult, options: OutputOptions, stream: TextIO) -
             stream.write(f"  {problem}\n")
 
 
+def _render_registration(
+    registration: ManagedRootRegistration, options: OutputOptions, stream: TextIO
+) -> None:
+    if options.format == "json":
+        json.dump(registration.to_dict(), stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        return
+    color = options.uses_color(stream)
+    status = _styled("REGISTERED", "1;32", enabled=color)
+    stream.write(f"{status}  research register-root  {registration.root}\n")
+    if options.quiet:
+        return
+    stream.write("\nRegistration\n")
+    rows = [
+        ("Root", registration.root),
+        ("Marker", registration.marker),
+        ("State", "created" if registration.created else "existing"),
+    ]
+    width = max(len(label) for label, _value in rows)
+    for label, value in rows:
+        stream.write(f"  {label + ':':<{width + 2}}{value}\n")
+
+
 def _run_notify(arguments: argparse.Namespace) -> int:
     study = StudyConfig.load(arguments.study)
     event = ensure_notification(study, arguments.run_id, requeue=arguments.requeue)
     _render_notification(event, _output_options(arguments), sys.stdout)
     return EXIT_PROBLEMS if event.state == "failed" else EXIT_SUCCESS
+
+
+def _run_register_root(arguments: argparse.Namespace) -> int:
+    registration = register_managed_root(arguments.root)
+    _render_registration(registration, _output_options(arguments), sys.stdout)
+    return EXIT_SUCCESS
 
 
 async def _run_worker_async(arguments: argparse.Namespace) -> int:
@@ -197,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_notify(arguments)
         if arguments.command == "notify-worker":
             return asyncio.run(_run_worker_async(arguments))
+        if arguments.command == "register-root":
+            return _run_register_root(arguments)
         raise InvocationError(f"unsupported command: {arguments.command}")
     except StateValidationError as error:
         print(f"research validation failed: {error}", file=sys.stderr)

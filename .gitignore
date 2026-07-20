@@ -51,6 +51,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 
 # Translations
 *.mo
@@ -140,3 +141,6 @@ coverage.xml
 .pdm-python
 .vscode/*.code-workspace
 **/_version.py
+
+# Durable research runtime state
+logs/research/

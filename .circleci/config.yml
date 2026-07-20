@@ -1,70 +1,38 @@
 version: 2.1
 
-
 orbs:
-  codecov: codecov/codecov@3.2.4
-
+  codecov: codecov/codecov@6.0.0
 
 jobs:
-    check_code_quality:
-        docker:
-            - image: cimg/python:3.14
-        steps:
-            - checkout
-            - restore_cache:
-                keys:
-                  - v1-dependencies-{{ checksum "uv.lock" }}
-            - run:
-                name: Install uv
-                command: pip install --user uv
-            - run:
-                name: Install dependencies
-                command: uv sync --group dev --no-install-project
-            - save_cache:
-                paths:
-                  - ~/.cache/pip
-                  - ~/.cache/uv
-                key: v1-dependencies-{{ checksum "uv.lock" }}
-            - run: 
-                name: Run quality tests
-                command: make quality
-
-    run_tests:
-        docker:
-            - image: cimg/python:3.14
-        steps:
-            - checkout
-            - restore_cache:
-                keys:
-                  - v1-dependencies-{{ checksum "uv.lock" }}
-            - run:
-                name: Install dependencies
-                command: make init
-            - save_cache:
-                paths:
-                  - ~/.cache/pip
-                  - ~/.cache/uv
-                key: v1-dependencies-{{ checksum "uv.lock" }}
-            - run:
-                name: Run static type checking
-                command: make types
-            - run:
-                name: Run tests
-                command: make test-ci
-            - codecov/upload:
-                file: coverage.xml
-
-
-workflow_filters: &workflow_filters
-    filters:
-        branches:
-            only:
-                - master
-                - feat/circleci
-
+  check:
+    docker:
+      - image: cimg/python:3.14.6
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v2-uv-{{ checksum "uv.lock" }}
+      - run:
+          name: Install pinned uv
+          command: pip install --user uv==0.11.28
+      - run:
+          name: Install locked dependencies
+          command: uv sync --frozen --all-groups
+      - save_cache:
+          key: v2-uv-{{ checksum "uv.lock" }}
+          paths:
+            - ~/.cache/pip
+            - ~/.cache/uv
+      - run:
+          name: Run local quality gates
+          command: make check
+      - run:
+          name: Verify package build and install
+          command: make package-check
+      - codecov/upload:
+          files: coverage.xml
 
 workflows:
-    build_and_test:
-        jobs:
-            - check_code_quality
-            - run_tests
+  build-and-test:
+    jobs:
+      - check

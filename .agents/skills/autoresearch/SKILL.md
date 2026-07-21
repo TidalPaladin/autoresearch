@@ -134,10 +134,20 @@ Before launch:
 - Refuse a stale, unpushed, or mismatched source environment unless the user authorizes an exception and the exact state is recorded.
 - Do not commit or push merely because this skill requires recoverability. Obtain authorization and use `$git-github-workflow` for Git publication.
 
+For each authorized commit and push on a provisional study branch:
+
+- Run the repository-required local formatting, lint, type, and test gates. CI skipping does not replace local validation.
+- Inspect the CI provider and relevant workflow triggers. Add the provider's supported skip marker to provisional experiment commits by default; use `[skip ci]` for GitHub Actions workflows triggered by `push` or `pull_request`.
+- Do not skip CI when remote checks are part of the study protocol, the user explicitly requests them, repository policy requires them, or the provider or workflow does not honor commit-message skip markers.
+- Record the intentional CI skip with the commit and branch provenance.
+
+Treat a branch as adopted only when its work is selected for normal review, pull-request integration, or merge. Research promotion or replication alone does not adopt the branch. Once adopted, keep the branch tip free of CI-skip language and require normal CI to pass before integration. Prefer the next material integration commit without a skip marker. If no material change is available, obtain explicit authorization to create and push an empty follow-up commit without a skip marker.
+
 Record at minimum:
 
 - repository, dependency, and imported-source commits;
 - branch names and dirty states;
+- CI provider, relevant triggers, skip marker, and intentional skip or enabled state, when applicable;
 - lockfile or environment hash;
 - dataset and split hashes;
 - seed and hardware identity;

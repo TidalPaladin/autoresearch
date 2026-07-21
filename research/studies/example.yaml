@@ -1,2 +1,15 @@
+# The template parser accepts only id and log_root. A terminal-event producer
+# registers this exact root before writing state. For an existing queue, run:
+# uv run python scripts/research.py register-root --root logs/research
 id: example
 log_root: logs/research
+
+# A downstream adapter extends its own schema with these contracts:
+# - tracker operations declare an exact destination and every emitted data class;
+#   incomplete authorization selects local-only mode and records that mode;
+# - the supervisor terminates and reaps its child process group before releasing
+#   resource locks after every exceptional exit;
+# - polling changes only a run whose next_check_at is due, and a terminal wake
+#   leaves unrelated counters and schedules unchanged;
+# - research-log updates use stable operation IDs and terminal entries use the
+#   study_id, run_id, and attempt identity.

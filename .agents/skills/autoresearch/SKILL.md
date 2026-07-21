@@ -37,7 +37,8 @@ Recover existing state and artifacts before creating a new study. Then record:
 - artifact retention policy;
 - local research-log location and publication procedure;
 - managed study paths for the research log, atomic state, and run artifacts;
-- external tracker provider, account, project, authorization, approved data classes, and availability, when applicable.
+- external tracker provider, account, project, authorization, approved data classes, and availability, when applicable;
+- one emitted-data-class manifest for each tracker operation, including launch, summary, backfill, configuration, and provenance writes.
 
 Mark unknown items explicitly. Resolve each one before launch or record the limitation and obtain approval when it changes study validity, cost, or recoverability.
 
@@ -87,6 +88,8 @@ Use the study coordinator as the single writer for the shared Markdown log. Supe
 4. Render the prior bytes plus one complete update into a temporary file in the same directory.
 5. Flush and sync the temporary file, replace the log atomically, sync the directory, and release the lock.
 
+Use the repository's locked research-log helper when one exists. In this template, call `append_research_log` with the managed root, a stable header operation ID, and a stable entry operation ID. For terminal entries, pass `TerminalLogIdentity(study_id, run_id, attempt)`. Treat a `False` result as an idempotent replay, not a new entry.
+
 If the update cannot complete, leave the operation pending and do not mark it recorded. Order concurrent entries by lock acquisition, and use recorded terminal timestamps rather than append order to establish chronology.
 
 Never change historical entry content during atomic replacement. Correct mistakes with a dated amendment that identifies the prior entry and explains the correction. Keep routine polling details in atomic runtime state. Append exceptional events that affect interpretation, including stalls, retries, tracker loss, protocol amendments, and incomplete runs.
@@ -95,7 +98,11 @@ Never change historical entry content during atomic replacement. Correct mistake
 
 Treat W&B and other trackers as optional telemetry stores. They do not replace the local research log.
 
-Before any external write, require an approved external tracker destination and record the user's explicit authorization. Verify the provider, account, project, access controls, and retention policy. Apply the repository's data classification and consent rules. Exclude secrets, credentials, personal or protected data, proprietary data, and raw samples unless their transfer is explicitly approved. Use local-only tracking when approval or classification is missing or ambiguous.
+Before any external write, require an approved external tracker destination and record the user's explicit authorization. Verify the provider, account, project, access controls, and retention policy. Apply the repository's data classification and consent rules. Exclude secrets, credentials, personal or protected data, proprietary data, and raw samples unless their transfer is explicitly approved.
+
+Define the complete emitted data classes for each tracker operation before execution. Permit that operation to write online only when its exact destination is authorized and every emitted class is approved. Do not partially execute an operation online. If its destination, manifest, classification, or approval is missing or ambiguous, execute the complete operation in local-only mode. Apply this gate independently to launch, summary, backfill, configuration, provenance, and any adapter-specific write path.
+
+Record the requested tracker mode, effective `online` or `local-only` mode, destination, emitted classes, approved classes, and gating decision in local provenance before the operation. An online launch approval does not authorize a later summary, configuration, provenance, or backfill operation with a different manifest.
 
 When a tracker is available:
 
@@ -121,6 +128,7 @@ Before launch:
 - Run repository formatting, lint, type, and test gates.
 - Verify that code and required dependencies are committed, immutable, available, and matched by the execution environment.
 - Resolve managed study paths before launch. Reject repository roots, broad parent directories, symlink escapes, and paths that overlap source, configuration, dependency, or input-data files.
+- Register the exact notification root through the repository producer or explicit registration operation before discovery. Require its valid marker before recursively scanning an existing root.
 - Treat changes confined to the study specification's managed study paths as expected research state, not dirty source. Record their exact paths and prelaunch hashes or inventories.
 - Refuse unrelated dirty source, configuration, dependency, or data changes unless the user authorizes an exception and the exact diff is recorded.
 - Refuse a stale, unpushed, or mismatched source environment unless the user authorizes an exception and the exact state is recorded.
@@ -166,6 +174,8 @@ Keep artifacts needed for the baseline, confirmed results, retries, audits, and 
 
 Run jobs under a detached supervisor or another recoverable process. Before launch, persist the originating Codex thread identifier when the current surface exposes one.
 
+After child spawn, make the supervisor own the child process group until every child is reaped. On heartbeat failure, state-write failure, cancellation, interrupt, timeout, or any other exceptional supervisor exit, terminate the process group, escalate when graceful termination does not complete, and reap every child before releasing GPU or other resource locks. Surface cleanup failure and keep the resource lock while an owned child may still be running.
+
 Write atomic state containing:
 
 - study phase, run status, attempt, and decision;
@@ -210,13 +220,15 @@ Use at-least-once delivery:
 - deduplicate by event identifier;
 - make repeated delivery safe.
 
-On receipt, cancel only the terminal run's next routine poll. Preserve or recompute the study watchdog and routine polls for remaining active runs. Report the wake time, validate artifacts and provenance, update the research log, and continue the study decision flow.
+On receipt, cancel only the terminal run's next routine poll. Leave every unrelated run's routine check count, last interval, and `next_check_at` unchanged. Recompute a study-level watchdog only when that does not mutate another run's polling state. Report the wake time, validate artifacts and provenance, update the research log, and continue the study decision flow.
 
 Treat child exit, nonzero exit status, fatal signal, timeout, and cancellation as terminal events handled by an outer supervisor. A supervisor or host failure can prevent notification. Preserve a sparse watchdog that detects stale heartbeats and missed terminal events. When the current surface supports scheduled tasks, return to the same chat so monitoring retains its context; see [Scheduled tasks](https://learn.chatgpt.com/docs/automations). If thread resume is unavailable, record the limitation and use the watchdog as the primary monitor.
 
 ## Monitoring cadence
 
 Use event-driven terminal notifications with sparse polling as a fallback. A healthy run should need no more than five routine checks, including startup, progress, and planned terminal verification. A terminal wake event is not a poll.
+
+At the start of every coordinator invocation, read each active run's recorded `next_check_at`. Advance counters, inspect progress as a routine check, and calculate a new schedule only for runs whose time is due. Preserve non-due run state byte for byte. A wake for one run does not make any other run due.
 
 At every check-in, report:
 
@@ -296,12 +308,13 @@ Require an adapter to define:
 - `storage-report`
 - checkpoint and resume semantics;
 - current and planned epochs or another progress-counter contract;
-- polling bounds and timeout behavior;
-- managed study path classification;
+- polling bounds, due-only transitions, and timeout behavior;
+- managed study path classification and exact root registration;
 - metric names and convergence calculations;
 - data split and leakage rules;
-- tracker behavior and local fallback;
-- single-writer research-log and locking semantics;
+- per-operation tracker destinations, emitted-data-class manifests, authorization gates, effective mode, and local fallback;
+- single-writer research-log, stable operation IDs, terminal attempt identity, and locking semantics;
+- child process-group ownership, exceptional-exit termination, reaping, and resource-lock release order;
 - promotion and replication thresholds;
 - per-thread notification queue and active-turn handling;
 - terminal-state and notification delivery behavior.

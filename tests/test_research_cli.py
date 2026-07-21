@@ -12,6 +12,7 @@ from project.research.runtime import (
     StudyConfig,
     read_notification_event,
     record_terminal_event,
+    register_managed_root,
     write_notification_event,
 )
 
@@ -118,6 +119,7 @@ def test_no_color_overrides_always(study_file: Path, tmp_path: Path) -> None:
 
 
 def test_notify_validation_problem_uses_exit_one(study_file: Path, tmp_path: Path) -> None:
+    register_managed_root(tmp_path / "logs")
     result = run_cli(tmp_path, "notify", str(study_file), "missing-run")
 
     assert result.returncode == 1
@@ -165,6 +167,7 @@ def test_worker_unix_transport_requires_socket(tmp_path: Path) -> None:
 
 
 def test_worker_delivery_problem_uses_exit_one_and_clean_json(tmp_path: Path) -> None:
+    register_managed_root(tmp_path / "logs")
     path = tmp_path / "logs" / "study-a" / "runs" / "run-a" / "notification.json"
     path.parent.mkdir(parents=True)
     path.write_text("not-json", encoding="utf-8")
@@ -218,3 +221,64 @@ def test_notify_requeues_failed_event(study_file: Path, tmp_path: Path) -> None:
     assert json.loads(requeued_result.stdout)["state"] == "pending"
     path = Path(event.terminal_state_path).with_name("notification.json")
     assert read_notification_event(path, study.log_root).attempt_count == 0
+
+
+def test_register_root_reports_created_then_existing_as_json(tmp_path: Path) -> None:
+    root = tmp_path / "logs"
+
+    first = run_cli(
+        tmp_path,
+        "register-root",
+        "--root",
+        str(root),
+        "--format",
+        "json",
+    )
+    second = run_cli(
+        tmp_path,
+        "register-root",
+        "--root",
+        str(root),
+        "--format",
+        "json",
+    )
+
+    assert first.returncode == 0
+    assert first.stderr == ""
+    assert json.loads(first.stdout) == {
+        "created": True,
+        "marker": str(root.resolve() / ".autoresearch-root.json"),
+        "root": str(root.resolve()),
+    }
+    assert second.returncode == 0
+    assert json.loads(second.stdout)["created"] is False
+
+
+def test_register_root_text_is_pipe_safe_and_quiet(tmp_path: Path) -> None:
+    result = run_cli(
+        tmp_path,
+        "register-root",
+        "--root",
+        str(tmp_path / "logs"),
+        "--quiet",
+        "--color",
+        "always",
+        "--no-color",
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout.count("\n") == 1
+    assert "REGISTERED  research register-root" in result.stdout
+    assert "\x1b[" not in result.stdout
+
+
+def test_register_root_rejects_repository_root_with_exit_one(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+
+    result = run_cli(tmp_path, "register-root", "--root", str(repository))
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "repository root" in result.stderr

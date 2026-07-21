@@ -29,6 +29,7 @@ from project.research.runtime import (
     _atomic_write_json,
     read_notification_event,
     read_terminal_event,
+    validate_managed_root,
     write_notification_event,
 )
 
@@ -656,11 +657,10 @@ async def sweep_notifications(
 ) -> SweepResult:
     """Process each due current notification at most once in this sweep."""
 
-    managed_root = root.expanduser().resolve(strict=False)
-    if managed_root == Path(managed_root.anchor):
-        raise StateValidationError("notification root must not be a filesystem root")
-    if not managed_root.exists():
+    requested_root = root.expanduser()
+    if not requested_root.exists() and not requested_root.is_symlink():
         return SweepResult()
+    managed_root = validate_managed_root(requested_root)
     selected_now = now()
     if selected_now.tzinfo is None or selected_now.utcoffset() is None:
         raise StateValidationError("worker clock must return an offset-aware datetime")

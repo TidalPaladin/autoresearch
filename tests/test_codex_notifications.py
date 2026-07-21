@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from project.research import codex_notifications
 from project.research.codex_notifications import (
     MAX_DELIVERY_ATTEMPTS,
     AppServerProtocolError,
@@ -31,6 +32,7 @@ from project.research.runtime import (
     StudyConfig,
     read_notification_event,
     record_terminal_event,
+    register_managed_root,
     write_notification_event,
 )
 
@@ -597,10 +599,30 @@ async def test_sweep_handles_empty_root_root_safety_and_naive_clock(tmp_path: Pa
     with pytest.raises(StateValidationError, match="filesystem root"):
         await sweep_notifications(Path("/"), connect=connect)
     tmp_path.mkdir(exist_ok=True)
+    register_managed_root(tmp_path)
     with pytest.raises(StateValidationError, match="offset-aware"):
         await sweep_notifications(
             tmp_path, connect=connect, now=lambda: datetime(2026, 7, 20, 12, 0)
         )
+
+
+@run_async
+async def test_existing_unregistered_root_is_rejected_before_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "logs"
+    root.mkdir()
+
+    def discover_notifications(_root: Path) -> list[Path]:
+        raise AssertionError("unregistered root was scanned")
+
+    monkeypatch.setattr(codex_notifications, "_notification_paths", discover_notifications)
+
+    async def connect() -> ScriptedTransport:
+        raise AssertionError("unregistered event must not connect")
+
+    with pytest.raises(StateValidationError, match="not registered"):
+        await sweep_notifications(root, connect=connect)
 
 
 @run_async
@@ -627,6 +649,7 @@ async def test_sweep_marks_missing_thread_permanently_failed(
 
 @run_async
 async def test_sweep_reports_malformed_and_already_failed_state(tmp_path: Path) -> None:
+    register_managed_root(tmp_path / "logs")
     malformed = tmp_path / "logs" / "study-a" / "runs" / "run-a" / "notification.json"
     malformed.parent.mkdir(parents=True)
     malformed.write_text("not-json", encoding="utf-8")
@@ -651,6 +674,26 @@ async def test_sweep_reports_malformed_and_already_failed_state(tmp_path: Path) 
     assert failed_result.due == 0
     assert failed_result.exit_code == 1
     assert failed_result.to_dict()["failed"] == 1
+
+
+@run_async
+async def test_sweep_rejects_notification_symlink_escape(tmp_path: Path) -> None:
+    root = tmp_path / "logs"
+    register_managed_root(root)
+    outside = tmp_path / "outside-notification.json"
+    outside.write_text("do not read", encoding="utf-8")
+    notification_path = root / "study-a" / "runs" / "run-a" / "notification.json"
+    notification_path.parent.mkdir(parents=True)
+    notification_path.symlink_to(outside)
+
+    async def connect() -> ScriptedTransport:
+        raise AssertionError("escaped notification must not connect")
+
+    result = await sweep_notifications(root, connect=connect, now=lambda: NOW)
+
+    assert result.failed == 1
+    assert result.problems and "managed root" in result.problems[0]
+    assert outside.read_text(encoding="utf-8") == "do not read"
 
 
 @run_async

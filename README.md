@@ -21,6 +21,7 @@ Training and Codex communication are separate processes:
 
 ```text
 project worker
+  -> registers the exact managed root
   -> writes terminal.json
   -> writes notification.json with state pending
   -> notification worker reads the event
@@ -29,7 +30,7 @@ project worker
 
 `project/research/runtime.py` performs local file operations only. It writes terminal state before notification state and never waits for Codex. `project/research/codex_notifications.py` owns queue delivery and app-server communication. `scripts/research.py` exposes acknowledgement and one-shot worker commands.
 
-A notification error cannot change a terminal status such as `completed`, `failed`, or `timed_out`. It changes only delivery metadata in `notification.json`.
+A notification error cannot change a terminal status such as `completed`, `failed`, or `timed_out`. It changes only delivery metadata in `notification.json`. Notification discovery starts only after the worker validates the root's registration marker.
 
 ## Study and state layout
 
@@ -46,10 +47,13 @@ Current state uses this layout:
 
 ```text
 logs/research/
+  .autoresearch-root.json
   .notification-locks/
     <sha256-thread-id>.lock
     <sha256-thread-id>.accepted.json
   <study-id>/
+    .research-log.md.lock
+    research-log.md
     runs/
       <run-id>/
         .state.lock
@@ -61,7 +65,19 @@ logs/research/
             notification.json
 ```
 
-The current pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records.
+`.autoresearch-root.json` contains an exact schema version, marker kind, and canonical absolute root path. `record_terminal_event` creates it through an atomic same-directory replacement before producing queue state. An existing root without this marker is never scanned. Registration rejects files, filesystem and top-level roots, home directories and their parents, repository roots, broad working-directory parents, symlinked paths, and malformed or mismatched markers.
+
+The current terminal and notification pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records.
+
+### Register an existing root
+
+Roots created by a terminal-event producer are registered automatically. Register an existing queue before its first worker sweep:
+
+```bash
+uv run python scripts/research.py register-root --root logs/research
+```
+
+The command is idempotent and does not scan or replace existing queue contents. A nonexistent worker root remains an empty successful sweep, but an existing unregistered root returns validation exit code `1`. Inspect registration as JSON with `--format json`; the document contains `created`, `root`, and `marker`.
 
 Runtime state under `logs/research/` is ignored by Git. Do not commit generated terminal files, notification files, locks, accepted-event ledgers, logs, credentials, or app-server schemas.
 
@@ -96,6 +112,28 @@ If the process stops after `terminal.json` is synced but before `notification.js
 ```bash
 uv run python scripts/research.py notify research/studies/example.yaml pretrain-baseline-seed0
 ```
+
+## Append the research log
+
+Use `append_research_log` as the single-writer primitive for a shared Markdown study log. It acquires the stable `.research-log.md.lock`, re-reads after locking, creates the header with the first entry, and replaces the log through a synced same-directory temporary file.
+
+```python
+from pathlib import Path
+
+from project.research.runtime import TerminalLogIdentity, append_research_log
+
+append_research_log(
+    Path("logs/research/example/research-log.md"),
+    managed_root=Path("logs/research"),
+    header_operation_id="example-header",
+    header_markdown="# Example study\n\nFixed protocol.",
+    operation_id="pretrain-baseline-seed0-attempt-1",
+    markdown="## Completed\n\nHeadline metrics and provenance.",
+    terminal=TerminalLogIdentity("example", "pretrain-baseline-seed0", 1),
+)
+```
+
+The helper stores internal HTML-comment metadata with each complete Markdown block. Replaying the same operation or terminal attempt returns `False` without changing the file. Reusing an operation ID with different content fails validation. Terminal deduplication uses `study_id`, `run_id`, and `attempt`, so separate attempts remain separate even when their phase or event ID matches.
 
 ## Run a persistent Codex app-server daemon
 
@@ -140,6 +178,12 @@ Prefer stdio or a local Unix socket. Do not expose an unauthenticated app-server
 
 ## CLI behavior
 
+Register an exact worker root or validate its existing marker:
+
+```bash
+uv run python scripts/research.py register-root --root <path>
+```
+
 Inspect, reconstruct, or explicitly requeue one run:
 
 ```bash
@@ -156,7 +200,7 @@ uv run python scripts/research.py notify-worker --once \
   [--socket PATH]
 ```
 
-Both commands support `--format text|json`, `--color auto|always|never`, `--no-color`, and mutually exclusive `--quiet` or `--verbose`. Primary text or JSON goes to stdout. Warnings and diagnostics go to stderr. JSON is deterministic and never contains ANSI color.
+All commands support `--format text|json`, `--color auto|always|never`, `--no-color`, and mutually exclusive `--quiet` or `--verbose`. Primary text or JSON goes to stdout. Warnings and diagnostics go to stderr. JSON is deterministic and never contains ANSI color.
 
 Exit codes are:
 
@@ -209,12 +253,22 @@ Create and own that schedule in the ChatGPT desktop app. A scheduled task inside
 ## Security and failure boundaries
 
 - Treat study YAML, persisted JSON, file paths, app-server messages, and daemon errors as untrusted input.
+- Validate the exact managed-root marker before recursive notification discovery. Do not infer ownership from an existing directory or its contents.
 - Keep the daemon and Unix socket local. Apply filesystem permissions appropriate to the host.
 - Never put secrets, raw samples, logs, stack traces, or training output in a wake prompt.
 - Never let notification delivery change a terminal training result.
 - Never let the training process wait for Codex availability.
 - Use fake JSONL and Unix-socket servers in tests. Automated tests must not resume, steer, or wake a real Codex task.
 - Do not add daemon lifecycle management to the training process, supervisor, or notification worker.
+
+## Downstream adapter contract
+
+The generic package does not implement training, external trackers, process supervision, or monitoring schedules. A downstream adapter must implement these protocol rules:
+
+- Declare an emitted-data-class manifest for each tracker operation, including launch, summary, backfill, configuration, and provenance. An online write requires the exact destination and approval for every emitted class. Otherwise the complete operation remains local, and provenance records the requested and effective modes.
+- Own the child process group after spawn. On heartbeat or state-write failure, cancellation, interrupt, or another exceptional exit, terminate the group, escalate when required, and reap every child before releasing GPU or other resource locks.
+- Change a run's polling counter and `next_check_at` only when that run is due. A wake for a terminal run clears only that run's poll and leaves every unrelated run's counters and schedule unchanged.
+- Use registered managed roots and `append_research_log` semantics for notification state and the shared study log.
 
 ## Development commands
 
@@ -228,4 +282,21 @@ make check          # all non-rewriting gates
 make package-check  # build and import the wheel in an isolated environment
 ```
 
-The project-specific autoresearch skill is stored at `.agents/skills/autoresearch/`. Use it for experiment planning, launch, recovery, monitoring, comparison, and notification handling.
+## Canonical autoresearch skill
+
+The maintained skill is `.agents/skills/autoresearch/` in this repository. Use it for experiment planning, launch, recovery, monitoring, comparison, and notification handling. Copy that directory into downstream repositories so each project carries the contract it implements:
+
+```bash
+mkdir -p /path/to/downstream/.agents/skills/autoresearch
+cp -R .agents/skills/autoresearch/. \
+  /path/to/downstream/.agents/skills/autoresearch/
+```
+
+Synchronize downstream copies from this repository and validate the result with:
+
+```bash
+uv run python "${CODEX_HOME:-${HOME}/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" \
+  .agents/skills/autoresearch
+```
+
+The separately installed `~/.codex/skills/autoresearch` copy is deprecated. Do not edit it as a source. Remove it only after every consumer uses a repository copy or another installation synchronized from this canonical directory.

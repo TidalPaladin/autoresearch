@@ -37,6 +37,8 @@ APP_SERVER_BASELINE = "0.144.5"
 CLIENT_NAME = "autoresearch_notification_template"
 CLIENT_TITLE = "Autoresearch Notification Template"
 CLIENT_VERSION = "1.0.0"
+TERMINAL_WAKE_MODEL = "gpt-5.6-luna"
+TERMINAL_WAKE_EFFORT = "medium"
 DEFAULT_REQUEST_TIMEOUT = 15.0
 RETRY_BASE_SECONDS = 5.0
 RETRY_FACTOR = 2.0
@@ -376,6 +378,8 @@ async def deliver_notification(
                     "threadId": thread_id,
                     "input": input_items,
                     "clientUserMessageId": event.event_id,
+                    "model": TERMINAL_WAKE_MODEL,
+                    "effort": TERMINAL_WAKE_EFFORT,
                 },
             )
             turn = result.get("turn")

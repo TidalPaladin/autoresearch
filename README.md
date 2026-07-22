@@ -240,15 +240,39 @@ Inspect the terminal state and continue the study protocol.
 
 Raw logs, stack traces, error text, model output, and training output never enter the prompt.
 
-## Scheduled one-shot polling
+## Event-driven wakeups and scheduled fallback
 
-A scheduled task can run the worker periodically when maintaining a standalone controller is unnecessary:
+Prefer a host controller or local non-model watcher that invokes the one-shot
+worker after `notification.json` is durable. Do not keep a ChatGPT or Codex turn
+open to sleep or poll terminal files. The watcher must not change terminal
+training state or make training wait for Codex.
+
+When an event source is unavailable, a scheduled task can run the worker as a
+sparse fallback:
 
 ```bash
 uv run python scripts/research.py notify-worker --once --root logs/research
 ```
 
-Create and own that schedule in the ChatGPT desktop app. A scheduled task inside the originating chat retains that chat's context and is suited to polling long-running local work. Keep the computer on, the app running, and the repository available. This template does not create or modify schedules. See the [scheduled tasks documentation](https://learn.chatgpt.com/docs/automations.md).
+Create and own that schedule in the ChatGPT desktop app. Explicitly select
+GPT-5.6 Luna with medium reasoning once in the scheduled-task configuration;
+do not inherit a higher-cost chat default. A scheduled task inside the
+originating chat retains that chat's context. Keep the computer on, the app
+running, and the repository available. This template does not create or modify
+schedules. See the [scheduled tasks documentation](https://learn.chatgpt.com/docs/automations.md).
+
+App-server `turn/start` also accepts `model` and `effort` overrides, so a
+dedicated idle monitor wake can select `gpt-5.6-luna` and `medium`
+automatically. `turn/steer` cannot replace the model of an active turn. The
+template notifier sends the override when starting an idle task; adapters inherit
+that automatic event-wake selection.
+
+Usage reporting is opportunistic. During an existing monitoring, terminal, or
+handoff report, sample current Codex rate-limit telemetry once when available
+and include the observation time, used and remaining percentages, reset time,
+and change from the prior report. Do not create a separate scheduled task, wake,
+wait, or polling loop for usage alone. The sample does not count as a research
+monitoring check.
 
 ## Security and failure boundaries
 

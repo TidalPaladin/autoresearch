@@ -53,6 +53,9 @@ Notification failure must never change terminal training status. The runtime rec
 - Define the exact destination and emitted data classes for every external-tracker operation. Permit an online write only when the destination and every emitted class are approved; otherwise keep the whole operation local and record the effective mode.
 - After spawning a child, own its process group until it is terminated and reaped. Perform this cleanup after every exceptional exit and before releasing GPU or other resource locks.
 - Advance a run's monitoring counters or `next_check_at` only when that run is due. A terminal wake must leave unrelated run counters and schedules unchanged and clear only the terminal run's poll.
+- Use terminal events as the primary wake path. Never keep a Codex turn open to sleep or poll; a local non-model watcher may wake Codex only for terminal events, exceptional safety conditions, or due sparse watchdog checks.
+- Pin read-only scheduled monitoring to GPT-5.6 Luna with medium reasoning when model selection is available. Record the effective model and any fallback.
+- During a research report turn that is already running, sample current Codex rate-limit telemetry once if available and include a compact usage snapshot. Never create a separate schedule, wake, wait, or polling loop for usage reporting, and do not advance research monitoring counters for it.
 
 ## App-server ownership
 
@@ -61,6 +64,7 @@ Notification failure must never change terminal training status. The runtime rec
 - Keep app-server communication out of training and supervisor processes.
 - Use `codex app-server proxy` for JSONL stdio or a local WebSocket-over-Unix connection.
 - Mark acceptance only after app-server accepts `turn/start` or `turn/steer`.
+- For an idle dedicated monitor turn, prefer a `turn/start` override of `model: gpt-5.6-luna` and `effort: medium`. A `turn/steer` request inherits the active turn's model.
 - Leave unknown states, turn races, protocol errors, and connection failures queued for bounded retry.
 - Never auto-approve an app-server request.
 - Send only the fixed trusted wake prompt. Do not include raw logs, errors, stack traces, training output, or model output.

@@ -285,6 +285,16 @@ and change from the prior report. Do not create a separate scheduled task, wake,
 wait, or polling loop for usage alone. The sample does not count as a research
 monitoring check.
 
+When an authorized pull request includes terminal comparative results, refresh
+its body after pushing the result commit. Add a `## Findings` table generated
+from the committed structured summary with every evaluated variant or
+preregistered aggregate, key hyperparameters, primary and convergence metrics,
+per-run wall time or another predefined resource measure, and promotion
+decision. Report total study wall span and summed run time or compute cost
+separately, mark censored results, and distinguish active from wall time and
+nominal from effective hyperparameters. Omit this section for protocol-only
+changes and studies that are still active.
+
 ## Security and failure boundaries
 
 - Treat study YAML, persisted JSON, file paths, app-server messages, and daemon errors as untrusted input.

@@ -74,3 +74,4 @@ Notification failure must never change terminal training status. The runtime rec
 ## Git and publication
 
 Do not commit, tag, push, create a pull request, publish artifacts, create scheduled tasks, or modify external trackers without explicit user authorization.
+When an authorized pull request contains terminal comparative research results, update its body after the result commit is pushed with a `## Findings` table generated from the committed structured summary. Include every evaluated variant or preregistered aggregate, key hyperparameters, primary and convergence metrics, elapsed wall time, decision, total study span, and summed run time or compute cost; mark censored values and distinguish active from wall time. Omit the section for protocol-only changes and active studies.

@@ -344,6 +344,28 @@ Report:
 - notification delivery status;
 - unresolved limitations and the next authorized action.
 
+When pull-request publication is authorized and the branch contains terminal
+comparative results, create or refresh a `## Findings` section in the pull
+request body after the committed result summary is pushed. Generate a Markdown
+table from the committed structured summary rather than transcribing metrics
+from memory. Include one row per evaluated variant or preregistered aggregate
+and columns for:
+
+- variant and baseline, candidate, or winner role;
+- the key mechanism or hyperparameters needed to interpret the comparison;
+- primary outcome and convergence metrics;
+- uncertainty for replicated results and explicit censoring where applicable;
+- elapsed wall time or another predefined resource measure;
+- promotion decision.
+
+State the total study wall span and summed run time or compute cost when
+concurrency makes them differ. Define thresholds, distinguish active time from
+wall time, and distinguish nominal from effective hyperparameters when those
+details affect interpretation. Link the canonical local record and approved
+external tracker. Keep exact stored values or documented rounding. Omit the
+section when the branch has no terminal comparative result, such as a
+protocol-only change or an active study.
+
 ## Domain adapter contract
 
 Require an adapter to define:

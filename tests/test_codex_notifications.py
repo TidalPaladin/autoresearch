@@ -38,6 +38,8 @@ from project.research.runtime import (
 
 EVENT_ID = "12345678-1234-5678-9234-567812345678"
 THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
+EXPECTED_WAKE_MODEL = "gpt-5.6-luna"
+EXPECTED_WAKE_EFFORT = "medium"
 NOW = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
 
 
@@ -145,6 +147,8 @@ async def test_idle_thread_starts_turn_after_fresh_read(tmp_path: Path) -> None:
     start = transport.sent[-1]["params"]
     assert start["clientUserMessageId"] == EVENT_ID
     assert start["input"] == [{"type": "text", "text": build_wake_prompt(event)}]
+    assert start["model"] == EXPECTED_WAKE_MODEL
+    assert start["effort"] == EXPECTED_WAKE_EFFORT
     assert accepted.rpc_method == "turn/start"
     assert accepted.turn_id == "new-turn"
 
@@ -163,6 +167,8 @@ async def test_active_thread_steers_sole_in_progress_turn(tmp_path: Path) -> Non
     steer = transport.sent[-1]
     assert steer["method"] == "turn/steer"
     assert steer["params"]["expectedTurnId"] == "active-turn"
+    assert "model" not in steer["params"]
+    assert "effort" not in steer["params"]
     assert accepted.turn_id == "active-turn"
 
 

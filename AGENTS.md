@@ -54,6 +54,8 @@ Notification failure must never change terminal training status. The runtime rec
 - After spawning a child, own its process group until it is terminated and reaped. Perform this cleanup after every exceptional exit and before releasing GPU or other resource locks.
 - Advance a run's monitoring counters or `next_check_at` only when that run is due. A terminal wake must leave unrelated run counters and schedules unchanged and clear only the terminal run's poll.
 - Use terminal events as the primary wake path. Never keep a Codex turn open to sleep or poll; a local non-model watcher may wake Codex only for terminal events, exceptional safety conditions, or due sparse watchdog checks.
+- For long-running adapters, define one-shot first-cycle, supervisor-loss, and progress-stall lifecycle events. Use durable file events, process-exit handles, and explicit deadlines; never wake for routine progress, heartbeat, notification retry, or acceptance writes.
+- Gate delivery after a transport failure until an external readiness signal such as daemon socket replacement or a due sparse recovery check. Notification backoff must not become a polling loop.
 - Pin read-only scheduled monitoring to GPT-5.6 Luna with medium reasoning when model selection is available. Record the effective model and any fallback.
 - During a research report turn that is already running, sample current Codex rate-limit telemetry once if available and include a compact usage snapshot. Never create a separate schedule, wake, wait, or polling loop for usage reporting, and do not advance research monitoring counters for it.
 

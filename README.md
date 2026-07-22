@@ -247,6 +247,17 @@ worker after `notification.json` is durable. Do not keep a ChatGPT or Codex turn
 open to sleep or poll terminal files. The watcher must not change terminal
 training state or make training wait for Codex.
 
+The generic template implements terminal events and leaves trainer and
+supervisor mechanics to the domain adapter. Long-running adapters should add
+one-shot lifecycle records for the first recovery-confirming
+train-validation-checkpoint cycle, supervisor loss without terminal state, and
+trainer-progress stalls. Drive their controller from durable file events,
+process-exit handles, and explicit progress deadlines. Routine progress,
+heartbeats, notification retries, and acceptance writes must not wake Codex or
+retrigger delivery. After a transport failure, keep events queued and gate more
+automatic attempts until daemon socket replacement or a due sparse recovery
+check.
+
 When an event source is unavailable, a scheduled task can run the worker as a
 sparse fallback:
 

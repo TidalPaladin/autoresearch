@@ -202,14 +202,20 @@ Write atomic state containing:
 
 Write terminal state atomically on completion, failure, crash, timeout, or cancellation. Resume the same experiment with model, optimizer or scheduler, progress counters, random-state policy, tracker identity, and cumulative active runtime. Do not reset convergence clocks or the monitoring budget after resuming.
 
-## Terminal notifications
+For long-running runs, require the domain adapter to define durable lifecycle
+sources as well as terminal truth. At minimum, consider one recovery-confirming
+milestone after the first train-validation-checkpoint cycle, supervisor loss
+without terminal state, and a trainer-progress deadline. Keep routine progress
+local. Lifecycle events must be one-shot and idempotent per run attempt.
 
-Require the supervisor to write terminal state before notifying Codex. Add a domain-adapter `notify` operation with this logical input:
+## Lifecycle and terminal notifications
+
+Require the supervisor to write terminal state before notifying Codex. Add a domain-adapter `notify` operation with this logical input for every wake-worthy lifecycle event:
 
 - unique event identifier;
 - study, run, and attempt identifiers;
-- terminal status and ISO 8601 occurrence time with UTC offset;
-- terminal-state path;
+- event kind, status, and ISO 8601 occurrence time with UTC offset;
+- absolute event-state path;
 - originating Codex thread identifier.
 
 When supported, resume the recorded thread with the Codex SDK or app-server and inspect its runtime status. App-server clients may use `thread/resume` and `thread/read`; see [Codex App Server](https://developers.openai.com/codex/app-server/). Deliver the wake input according to thread state:
@@ -223,7 +229,7 @@ When supported, resume the recorded thread with the Codex SDK or app-server and 
 
 Serialize wake delivery per thread. Mark an event accepted only after `turn/start` or `turn/steer` accepts it. Prefer the SDK, stdio, or a Unix socket. Do not depend on the experimental non-loopback WebSocket transport.
 
-Keep wake prompts small. Include identifiers and the terminal-state path, not raw logs, stack traces, or other untrusted run output. Re-read and validate persisted state before acting.
+Keep wake prompts small. Include identifiers and the event-state path, not raw logs, stack traces, or other untrusted run output. Re-read and validate persisted state before acting.
 
 Use at-least-once delivery:
 
@@ -238,14 +244,22 @@ On receipt, cancel only the terminal run's next routine poll. Leave every unrela
 Treat child exit, nonzero exit status, fatal signal, timeout, and cancellation as terminal events handled by an outer supervisor. A supervisor or host failure can prevent notification. Preserve a sparse watchdog that detects stale heartbeats and missed terminal events. When the current surface supports scheduled tasks, return to the same chat so monitoring retains its context; see [Scheduled tasks](https://learn.chatgpt.com/docs/automations). Configure a read-only scheduled monitor explicitly for GPT-5.6 Luna with medium reasoning instead of inheriting the chat default. If thread resume or model selection is unavailable, record the limitation and use the watchdog as the primary monitor.
 
 Never keep a model turn open merely to sleep, wait on a process or file, or poll
-at sub-minute intervals. A local non-model watcher may wait for terminal state,
-but it must wake Codex only for a durable terminal event, an exceptional safety
-condition, or a due sparse watchdog check. Coalesce related terminal events into
-one recovery turn when doing so preserves per-run state and ordering.
+at sub-minute intervals. Prefer a local non-model controller that reacts to
+durable file events, process-exit handles, and explicit progress deadlines. It
+may wake Codex only for the first recovery-confirming cycle, durable terminal
+state, an exceptional safety condition, or a due sparse watchdog check. Routine
+progress, heartbeat, notification retry, and acceptance writes must not wake the
+model or recursively trigger delivery. Coalesce related events into one recovery
+turn when doing so preserves per-run state and ordering.
+
+If delivery fails, leave the event queued and gate further automatic attempts
+until an external readiness signal such as daemon socket replacement or a due
+sparse recovery check. Do not turn notification backoff into a model or
+filesystem polling loop.
 
 ## Monitoring cadence
 
-Use event-driven terminal notifications as the primary path and sparse polling
+Use event-driven lifecycle notifications as the primary path and sparse polling
 only as a fallback. Do not pair healthy notifications with an interactive
 wait/poll loop. Pin read-only scheduled fallback checks to GPT-5.6 Luna with
 medium reasoning when model selection is available; select it once in the
@@ -352,7 +366,9 @@ Require an adapter to define:
 - single-writer research-log, stable operation IDs, terminal attempt identity, and locking semantics;
 - child process-group ownership, exceptional-exit termination, reaping, and resource-lock release order;
 - promotion and replication thresholds;
+- lifecycle milestones, trainer progress deadlines, and supervisor-loss detection;
+- non-model event-controller sources and retry-loop suppression;
 - per-thread notification queue and active-turn handling;
-- terminal-state and notification delivery behavior.
+- lifecycle, terminal-state, and notification delivery behavior.
 
 Keep this skill responsible for research discipline, recoverability, and safety. Keep the adapter responsible for domain mechanics.

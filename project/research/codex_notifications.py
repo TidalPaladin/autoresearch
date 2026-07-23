@@ -57,6 +57,18 @@ CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]+")
 JsonObject = dict[str, Any]
 
 
+def _initialize_params() -> JsonObject:
+    """Declare the capability required for permission-aware thread resumes."""
+    return {
+        "clientInfo": {
+            "name": CLIENT_NAME,
+            "title": CLIENT_TITLE,
+            "version": CLIENT_VERSION,
+        },
+        "capabilities": {"experimentalApi": True},
+    }
+
+
 class MessageTransport(Protocol):
     """One-message-at-a-time JSON transport used by the RPC dispatcher."""
 
@@ -301,16 +313,7 @@ async def capture_wake_context(
     """Capture the effective live thread authority before a managed dispatch."""
     selected_at = captured_at or datetime.now(UTC)
     async with RpcClient(transport, request_timeout=request_timeout) as client:
-        await client.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": CLIENT_NAME,
-                    "title": CLIENT_TITLE,
-                    "version": CLIENT_VERSION,
-                }
-            },
-        )
+        await client.request("initialize", _initialize_params())
         await client.notify("initialized", {})
         resumed = await client.request(
             "thread/resume",
@@ -370,16 +373,7 @@ async def deliver_notification(
         )
 
     async with RpcClient(transport, request_timeout=request_timeout) as client:
-        await client.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": CLIENT_NAME,
-                    "title": CLIENT_TITLE,
-                    "version": CLIENT_VERSION,
-                }
-            },
-        )
+        await client.request("initialize", _initialize_params())
         await client.notify("initialized", {})
         resumed = await client.request("thread/resume", wake_context.resume_params())
         _thread_from_result(resumed, "thread/resume", thread_id)

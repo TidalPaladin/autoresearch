@@ -124,14 +124,34 @@ def app_server_handler(
     permission_profile: str = PERMISSION_PROFILE,
     approval_policy: str = APPROVAL_POLICY,
 ) -> Callable[[dict[str, Any]], list[dict[str, Any]]]:
+    experimental_api = False
+
     def handle(message: dict[str, Any]) -> list[dict[str, Any]]:
+        nonlocal experimental_api
         if "id" not in message:
             return []
         request_id = message["id"]
         method = message["method"]
         interleaved = {"method": "thread/status/changed", "params": {}}
         if method == "initialize":
+            experimental_api = (
+                message["params"].get("capabilities", {}).get("experimentalApi") is True
+            )
             return [interleaved, {"id": request_id, "result": {"userAgent": "fake"}}]
+        if (
+            method == "thread/resume"
+            and message["params"].get("permissions")
+            and not experimental_api
+        ):
+            return [
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32600,
+                        "message": "thread/resume.permissions requires experimentalApi capability",
+                    },
+                }
+            ]
         if method == "thread/resume":
             return [
                 {
@@ -193,6 +213,10 @@ async def test_capture_wake_context_records_effective_profile_and_approval_polic
     )
 
     assert context == WAKE_CONTEXT
+    initialize = next(
+        message for message in transport.sent if message.get("method") == "initialize"
+    )
+    assert initialize["params"]["capabilities"] == {"experimentalApi": True}
     resume = next(message for message in transport.sent if message.get("method") == "thread/resume")
     assert resume["params"] == {
         "threadId": THREAD_ID,
@@ -694,9 +718,10 @@ async def test_deliver_rejects_malformed_lifecycle_responses(
 async def test_deliver_rejects_unexpected_steer_turn_id(tmp_path: Path) -> None:
     event = notification(tmp_path)
     turns = [{"id": "active-turn", "status": "inProgress"}]
+    base_handler = app_server_handler(status="active", turns=turns)
 
     def handle(message: dict[str, Any]) -> list[dict[str, Any]]:
-        responses = app_server_handler(status="active", turns=turns)(message)
+        responses = base_handler(message)
         if message.get("method") == "turn/steer":
             return [{"id": message["id"], "result": {"turnId": "other-turn"}}]
         return responses

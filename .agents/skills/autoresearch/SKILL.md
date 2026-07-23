@@ -13,9 +13,12 @@ Preserve the user's scope and authority:
 
 - Read and inspect within the repository and declared experiment environment.
 - Modify code, configuration, state, logs, and managed artifacts only within the study scope.
-- Do not publish, push, delete artifacts, change protected branches, alter production systems, or exceed recorded resource limits without explicit authorization.
+- Treat normal non-destructive Git operations in the primary repository as standing-authorized. Create or switch study branches, stage, commit, fetch, and push non-protected branches without asking again.
+- Treat local Git operations in tandem repositories as standing-authorized. Create branches and commits locally, and accept a clean exact-SHA local commit as sufficient provenance. Do not push a tandem repository without explicit permission.
+- Treat online W&B operations as standing-authorized for a declared research destination and declared non-sensitive data classes. Track experiments online by default.
+- Do not delete artifacts, rewrite history, push protected branches, open pull requests, publish through a non-W&B service, alter production systems, or exceed recorded resource limits without the corresponding authorization.
 - Escalate when a decision would change the study design, resource use, retention policy, or authorized scope.
-- Do not treat invocation of this skill as authorization for Git publication or destructive retention.
+- Do not treat invocation of this skill as authorization for destructive retention or GitHub-side operations.
 
 Allow planning and recovery without an active persistent goal. Before launching any experiment, require an active goal whose completion criteria cover the study. If none is active, stop before launch and ask the user to start one.
 
@@ -96,13 +99,13 @@ Never change historical entry content during atomic replacement. Correct mistake
 
 ## External experiment tracking
 
-Treat W&B and other trackers as optional telemetry stores. They do not replace the local research log.
+Treat W&B as the default online telemetry store and the local research log as canonical. Treat other trackers as optional and separately authorized.
 
-Before any external write, require an approved external tracker destination and record the user's explicit authorization. Verify the provider, account, project, access controls, and retention policy. Apply the repository's data classification and consent rules. Exclude secrets, credentials, personal or protected data, proprietary data, and raw samples unless their transfer is explicitly approved.
+Use the standing W&B authorization for launch, summary, backfill, configuration, and provenance operations. Before each operation, verify the entity, project, access controls, retention policy, and complete emitted-data manifest. Restrict writes to declared non-sensitive metrics, configs, and provenance. Exclude secrets, credentials, personal or protected data, proprietary data, and raw samples unless their transfer is explicitly approved.
 
-Define the complete emitted data classes for each tracker operation before execution. Permit that operation to write online only when its exact destination is authorized and every emitted class is approved. Do not partially execute an operation online. If its destination, manifest, classification, or approval is missing or ambiguous, execute the complete operation in local-only mode. Apply this gate independently to launch, summary, backfill, configuration, provenance, and any adapter-specific write path.
+Require an exact W&B destination and an explicit emitted-data manifest for each operation. Treat a missing destination, manifest, classification, or required data class as a preflight error instead of silently converting a scientific run to local-only mode. Use offline mode only for an explicitly scoped fallback test or a recorded tracker outage.
 
-Record the requested tracker mode, effective `online` or `local-only` mode, destination, emitted classes, approved classes, and gating decision in local provenance before the operation. An online launch approval does not authorize a later summary, configuration, provenance, or backfill operation with a different manifest.
+Record the requested tracker mode, effective `online` or `local-only` mode, destination, emitted classes, standing authorization, and gating decision in local provenance before the operation. Gate launch, summary, backfill, configuration, provenance, and adapter-specific writes independently even though W&B consent is standing.
 
 When a tracker is available:
 
@@ -131,17 +134,17 @@ Before launch:
 - Register the exact notification root through the repository producer or explicit registration operation before discovery. Require its valid marker before recursively scanning an existing root.
 - Treat changes confined to the study specification's managed study paths as expected research state, not dirty source. Record their exact paths and prelaunch hashes or inventories.
 - Refuse unrelated dirty source, configuration, dependency, or data changes unless the user authorizes an exception and the exact diff is recorded.
-- Refuse a stale, unpushed, or mismatched source environment unless the user authorizes an exception and the exact state is recorded.
-- Do not commit or push merely because this skill requires recoverability. Obtain authorization and use `$git-github-workflow` for Git publication.
+- Refuse a stale, unpushed, or mismatched primary repository. Permit clean unpushed tandem repositories when their local commits, recorded SHAs, dependency pins, and frozen imported sources match exactly.
+- Use `$git-github-workflow` for Git operations. Commit and push the primary study branch without another permission request. Commit tandem-repository work locally, but do not push it without explicit permission.
 
-For each authorized commit and push on a provisional study branch:
+For each commit and push on a provisional study branch:
 
 - Run the repository-required local formatting, lint, type, and test gates. CI skipping does not replace local validation.
 - Inspect the CI provider and relevant workflow triggers. Add the provider's supported skip marker to provisional experiment commits by default; use `[skip ci]` for GitHub Actions workflows triggered by `push` or `pull_request`.
 - Do not skip CI when remote checks are part of the study protocol, the user explicitly requests them, repository policy requires them, or the provider or workflow does not honor commit-message skip markers.
 - Record the intentional CI skip with the commit and branch provenance.
 
-Treat a branch as adopted only when its work is selected for normal review, pull-request integration, or merge. Research promotion or replication alone does not adopt the branch. Once adopted, keep the branch tip free of CI-skip language and require normal CI to pass before integration. Prefer the next material integration commit without a skip marker. If no material change is available, obtain explicit authorization to create and push an empty follow-up commit without a skip marker.
+Treat a branch as adopted only when its work is selected for normal review, pull-request integration, or merge. Research promotion or replication alone does not adopt the branch. Once adopted, keep the branch tip free of CI-skip language and require normal CI to pass before integration. Prefer the next material integration commit without a skip marker. If no material change is available, create and push an empty follow-up commit without a skip marker on the primary non-protected branch.
 
 Record at minimum:
 
@@ -156,7 +159,7 @@ Record at minimum:
 - tracker identity and URL, when present;
 - local state, log, and artifact paths.
 
-Keep uncommitted research records locally recoverable. Publish them only when authorized.
+Keep uncommitted research records locally recoverable. Push primary-repository records as part of the standing Git authorization; keep tandem-repository records local until their push is authorized.
 
 ## Resource and storage safety
 
@@ -201,6 +204,8 @@ Write atomic state containing:
 - notification event, attempts, errors, acceptance time, and delivery state.
 
 Write terminal state atomically on completion, failure, crash, timeout, or cancellation. Resume the same experiment with model, optimizer or scheduler, progress counters, random-state policy, tracker identity, and cumulative active runtime. Do not reset convergence clocks or the monitoring budget after resuming.
+
+After dispatching a round, verify that every launched run has a supervisor identity and durable startup state. Then immediately return the persistent goal to its event-wait state; use `blocked` when the goal API and higher-priority policy permit it. Treat this as normal waiting, not a failed study. Do not leave the goal active merely to generate automatic continuations. If the surface cannot enter the wait state immediately, end the coordinator turn, record the limitation once, and do not poll. A lifecycle notification reactivates a blocked goal.
 
 For long-running runs, require the domain adapter to define durable lifecycle
 sources as well as terminal truth. At minimum, consider one recovery-confirming
@@ -273,6 +278,11 @@ repeated manual changes. A healthy run should need no more than five routine
 checks, including startup, progress, and planned terminal verification. A
 terminal wake event is not a poll.
 
+After processing a nonterminal lifecycle event, return the goal to the same
+event-wait state before ending the coordinator turn when no immediate study
+mutation remains. Do not spend automatic goal continuations rediscovering that
+the run is still active.
+
 At the start of every coordinator invocation, read each active run's recorded `next_check_at`. Advance counters, inspect progress as a routine check, and calculate a new schedule only for runs whose time is due. Preserve non-due run state byte for byte. A wake for one run does not make any other run due.
 
 At every check-in, report:
@@ -293,6 +303,28 @@ informational and must not advance run check counters or alter `next_check_at`.
 Never create a scheduled task, start or wake a turn, wait, or poll solely to
 collect usage telemetry. If it is unavailable, omit it or report that once
 without retrying.
+
+### Monitoring token accounting
+
+Apply token-use limits only to work whose primary purpose is polling or
+inspecting a live experiment. This includes scheduled or sparse status checks,
+progress and log inspection, notification triage, and the monitoring report
+produced from those observations.
+
+Exclude all other research work. Excluded work includes initial recovery and
+study design, implementation, configuration, tests, benchmarks, preflight,
+launch preparation and execution, result analysis, promotion decisions,
+summaries, and Git operations. Code, configuration, test, or validation work
+that becomes necessary during a study is also excluded.
+
+When token totals are available, capture the total immediately before and
+after each monitoring interval and add only that positive delta to the
+monitoring token counter. Close the interval before switching to excluded work.
+If a reset, missing snapshot, or mixed interval prevents attribution, mark that
+interval unmeasured. Never substitute aggregate goal or task token usage.
+Evaluate any excess-use stop or block rule only against the monitoring token
+counter. Rate-limit window percentages remain informational and are not a
+monitoring token counter.
 
 Check shortly after launch to catch startup failures. Use the next check to obtain a progress-rate estimate. After every positive epoch delta, calculate:
 

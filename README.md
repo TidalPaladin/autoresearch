@@ -20,8 +20,10 @@ The repository requires Python 3.12 or later and `uv==0.11.28`. Direct dependenc
 Training and Codex communication are separate processes:
 
 ```text
+launch adapter
+  -> captures the live Codex permission profile and approval policy
+  -> registers the exact managed root and writes immutable wake-context.json
 project worker
-  -> registers the exact managed root
   -> writes terminal.json
   -> writes notification.json with state pending
   -> notification worker reads the event
@@ -57,6 +59,7 @@ logs/research/
     runs/
       <run-id>/
         .state.lock
+        wake-context.json
         terminal.json
         notification.json
         attempts/
@@ -67,7 +70,7 @@ logs/research/
 
 `.autoresearch-root.json` contains an exact schema version, marker kind, and canonical absolute root path. `record_terminal_event` creates it through an atomic same-directory replacement before producing queue state. An existing root without this marker is never scanned. Registration rejects files, filesystem and top-level roots, home directories and their parents, repository roots, broad working-directory parents, symlinked paths, and malformed or mismatched markers.
 
-The current terminal and notification pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records.
+The current terminal and notification pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records. `wake-context.json` is written once before dispatch and cannot be replaced with a different profile, approval policy, thread, or capture time.
 
 ### Register an existing root
 
@@ -80,6 +83,38 @@ uv run python scripts/research.py register-root --root logs/research
 The command is idempotent and does not scan or replace existing queue contents. A nonexistent worker root remains an empty successful sweep, but an existing unregistered root returns validation exit code `1`. Inspect registration as JSON with `--format json`; the document contains `created`, `root`, and `marker`.
 
 Runtime state under `logs/research/` is ignored by Git. Do not commit generated terminal files, notification files, locks, accepted-event ledgers, logs, credentials, or app-server schemas.
+
+## Capture wake context before dispatch
+
+The launch adapter must capture the effective context while the originating
+Codex turn is live, then persist it before spawning the supervisor:
+
+```python
+import os
+
+from project.research.codex_notifications import (
+    UnixWebSocketTransport,
+    capture_wake_context,
+)
+from project.research.runtime import persist_wake_context
+
+
+async def persist_launch_wake_context(study, run_id, socket_path):
+    transport = await UnixWebSocketTransport.connect(socket_path)
+    wake_context = await capture_wake_context(
+        thread_id=os.environ["CODEX_THREAD_ID"],
+        expected_permission_profile=os.environ["CODEX_PERMISSION_PROFILE"],
+        transport=transport,
+    )
+    persist_wake_context(study, run_id, wake_context)
+    # Spawn the detached supervisor only after persistence succeeds.
+```
+
+The notifier passes the recorded profile and approval policy to
+`thread/resume`, verifies the returned effective values, and applies the same
+values to `turn/start`. Verification happens before a blocked goal can be
+reactivated. Missing context or any mismatch fails delivery permanently; the
+worker does not choose an implicit or broader profile.
 
 ## Record terminal state from project code
 
@@ -105,7 +140,7 @@ terminal, notification = record_terminal_event(
 )
 ```
 
-The originating task defaults to `CODEX_THREAD_ID`. Pass `originating_thread_id=` when the host exposes the ID through another trusted source. A missing task ID produces durable terminal state, but the notification worker marks delivery failed because it has no safe destination.
+The originating task defaults to `CODEX_THREAD_ID`. Pass `originating_thread_id=` when the host exposes the ID through another trusted source. `record_terminal_event` loads the previously persisted wake context. A missing task ID or wake context produces durable terminal state, but the notification worker marks delivery failed because it has no safe destination or permission context.
 
 If the process stops after `terminal.json` is synced but before `notification.json` is queued, reconstruct the pending event with:
 

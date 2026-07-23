@@ -185,7 +185,12 @@ Keep artifacts needed for the baseline, confirmed results, retries, audits, and 
 
 ## Launch and persistent state
 
-Run jobs under a detached supervisor or another recoverable process. Before launch, persist the originating Codex thread identifier when the current surface exposes one.
+Run jobs under a detached supervisor or another recoverable process. Before
+launch, capture the originating Codex thread's effective named permission
+profile and approval policy while that thread is live. Persist those values,
+the thread identifier, and the capture time as an immutable wake context in the
+managed run directory before child spawn. Do not infer a profile from defaults,
+hardcode a broader profile, or replace a run's recorded wake context.
 
 After child spawn, make the supervisor own the child process group until every child is reaped. On heartbeat failure, state-write failure, cancellation, interrupt, timeout, or any other exceptional supervisor exit, terminate the process group, escalate when graceful termination does not complete, and reap every child before releasing GPU or other resource locks. Surface cleanup failure and keep the resource lock while an owned child may still be running.
 
@@ -222,6 +227,15 @@ Require the supervisor to write terminal state before notifying Codex. Add a dom
 - event kind, status, and ISO 8601 occurrence time with UTC offset;
 - absolute event-state path;
 - originating Codex thread identifier.
+
+Require every deliverable event to resolve to the immutable wake context
+captured before its run started. Resume the originating thread with that exact
+named permission profile and approval policy, then verify the effective profile
+and policy returned by app-server before querying or changing the persistent
+goal. Apply the same context to `turn/start`. Missing context, a response that
+omits effective permission state, or any mismatch is a permanent delivery
+failure that requires explicit recovery. Never fall back to app-server defaults
+or broaden access to make a wake succeed.
 
 When supported, resume the recorded thread with the Codex SDK or app-server and inspect its runtime status. App-server clients may use `thread/resume` and `thread/read`; see [Codex App Server](https://developers.openai.com/codex/app-server/). Deliver the wake input according to thread state:
 
@@ -428,6 +442,7 @@ Require an adapter to define:
 - lifecycle milestones, trainer progress deadlines, and supervisor-loss detection;
 - non-model event-controller sources and retry-loop suppression;
 - per-thread notification queue and active-turn handling;
+- immutable launch-time wake-context capture, exact permission resume, and fail-closed verification;
 - lifecycle, terminal-state, and notification delivery behavior.
 
 Keep this skill responsible for research discipline, recoverability, and safety. Keep the adapter responsible for domain mechanics.

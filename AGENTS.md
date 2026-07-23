@@ -39,6 +39,7 @@ Use `uv==0.11.28`. Pin direct dependencies and commit `uv.lock`. Preserve Hatch 
 - Register each existing research root explicitly with `scripts/research.py register-root --root <path>` before notification discovery. Producers register new roots automatically.
 - Require the exact atomic `.autoresearch-root.json` marker before scanning an existing root. Reject filesystem, home, repository, broad parent, malformed, and symlinked roots.
 - Write and sync `terminal.json` before `notification.json`.
+- Capture the live originating thread's effective named permission profile and approval policy before child spawn. Persist them in an immutable per-run `wake-context.json`.
 - Use same-directory atomic replacement, file and directory sync, and stable sibling locks.
 - Validate identifiers, schemas, timestamps, matching fields, absolute managed paths, and resolved symlink containment before acting.
 - Archive a different prior current event before replacement. Deduplicate retries by event ID.
@@ -67,7 +68,8 @@ Notification failure must never change terminal training status. The runtime rec
 - Do not start, restart, or stop the daemon from repository code.
 - Keep app-server communication out of training and supervisor processes.
 - Connect directly to the running daemon's local Unix socket, discovering it through `codex app-server daemon version` unless the operator supplies an explicit path.
-- Query the originating thread goal before a lifecycle wake. Transition only `blocked` goals to `active`; preserve `paused`, `complete`, `usageLimited`, and `budgetLimited` states.
+- Resume with the run's exact captured permission profile and approval policy and verify the returned effective context before querying the originating thread goal. Never hardcode a broader profile or fall back to app-server defaults.
+- Treat missing or mismatched wake context as a permanent delivery failure. Transition only `blocked` goals to `active`; preserve `paused`, `complete`, `usageLimited`, and `budgetLimited` states.
 - Mark acceptance only after app-server accepts `turn/start` or `turn/steer`.
 - For an idle dedicated monitor turn, prefer a `turn/start` override of `model: gpt-5.6-luna` and `effort: medium`. A `turn/steer` request inherits the active turn's model.
 - Leave unknown states, turn races, protocol errors, and connection failures queued for bounded retry.

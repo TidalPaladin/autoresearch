@@ -14,15 +14,14 @@ import pytest
 
 from project.research import codex_notifications
 from project.research.codex_notifications import (
+    APP_SERVER_MESSAGE_LIMIT_BYTES,
     MAX_DELIVERY_ATTEMPTS,
     AppServerProtocolError,
-    JsonlStdioTransport,
     RpcClient,
     UnixWebSocketTransport,
     build_wake_prompt,
     deliver_notification,
     notification_lock_path,
-    stdio_connector,
     sweep_notifications,
     unix_connector,
 )
@@ -105,7 +104,11 @@ def thread(status: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def app_server_handler(
-    *, status: str, turns: list[dict[str, Any]], steer_error: bool = False
+    *,
+    status: str,
+    turns: list[dict[str, Any]],
+    steer_error: bool = False,
+    goal_status: str | None = "active",
 ) -> Callable[[dict[str, Any]], list[dict[str, Any]]]:
     def handle(message: dict[str, Any]) -> list[dict[str, Any]]:
         if "id" not in message:
@@ -119,6 +122,26 @@ def app_server_handler(
             return [{"id": request_id, "result": {"thread": thread(status, turns)}}]
         if method == "thread/read":
             return [{"id": request_id, "result": {"thread": thread(status, turns)}}]
+        if method == "thread/goal/get":
+            goal = None if goal_status is None else {"threadId": THREAD_ID, "status": goal_status}
+            return [
+                {
+                    "id": request_id,
+                    "result": {"goal": goal},
+                }
+            ]
+        if method == "thread/goal/set":
+            return [
+                {
+                    "id": request_id,
+                    "result": {
+                        "goal": {
+                            "threadId": THREAD_ID,
+                            "status": message["params"]["status"],
+                        }
+                    },
+                }
+            ]
         if method == "turn/start":
             return [{"id": request_id, "result": {"turn": {"id": "new-turn"}}}]
         if method == "turn/steer":
@@ -136,6 +159,48 @@ def app_server_handler(
 
 
 @run_async
+async def test_blocked_goal_is_resumed_before_wake(tmp_path: Path) -> None:
+    event = notification(tmp_path)
+    transport = ScriptedTransport(
+        app_server_handler(status="idle", turns=[], goal_status="blocked")
+    )
+
+    await deliver_notification(event, transport, request_timeout=0.2)
+
+    goal_set = next(
+        message for message in transport.sent if message.get("method") == "thread/goal/set"
+    )
+    assert goal_set["params"] == {"threadId": THREAD_ID, "status": "active"}
+
+
+@pytest.mark.parametrize(
+    "goal_status",
+    ["active", "paused", "complete", "usageLimited", "budgetLimited"],
+)
+@run_async
+async def test_nonblocked_goal_state_is_not_changed(tmp_path: Path, goal_status: str) -> None:
+    event = notification(tmp_path)
+    transport = ScriptedTransport(
+        app_server_handler(status="idle", turns=[], goal_status=goal_status)
+    )
+
+    await deliver_notification(event, transport, request_timeout=0.2)
+
+    assert not any(message.get("method") == "thread/goal/set" for message in transport.sent)
+
+
+@run_async
+async def test_missing_goal_does_not_block_wake(tmp_path: Path) -> None:
+    event = notification(tmp_path)
+    transport = ScriptedTransport(app_server_handler(status="idle", turns=[], goal_status=None))
+
+    accepted = await deliver_notification(event, transport, request_timeout=0.2)
+
+    assert accepted.rpc_method == "turn/start"
+    assert not any(message.get("method") == "thread/goal/set" for message in transport.sent)
+
+
+@run_async
 async def test_idle_thread_starts_turn_after_fresh_read(tmp_path: Path) -> None:
     event = notification(tmp_path)
     transport = ScriptedTransport(app_server_handler(status="idle", turns=[]))
@@ -143,7 +208,14 @@ async def test_idle_thread_starts_turn_after_fresh_read(tmp_path: Path) -> None:
     accepted = await deliver_notification(event, transport, request_timeout=0.2)
 
     methods = [message.get("method") for message in transport.sent]
-    assert methods == ["initialize", "initialized", "thread/resume", "thread/read", "turn/start"]
+    assert methods == [
+        "initialize",
+        "initialized",
+        "thread/resume",
+        "thread/goal/get",
+        "thread/read",
+        "turn/start",
+    ]
     start = transport.sent[-1]["params"]
     assert start["clientUserMessageId"] == EVENT_ID
     assert start["input"] == [{"type": "text", "text": build_wake_prompt(event)}]
@@ -172,13 +244,28 @@ async def test_active_thread_steers_sole_in_progress_turn(tmp_path: Path) -> Non
     assert accepted.turn_id == "active-turn"
 
 
+@run_async
+async def test_active_thread_steers_newest_in_progress_turn(tmp_path: Path) -> None:
+    event = notification(tmp_path)
+    turns = [
+        {"id": "stale-turn", "status": "inProgress"},
+        {"id": "completed-turn", "status": "completed"},
+        {"id": "active-turn", "status": "inProgress"},
+    ]
+    transport = ScriptedTransport(app_server_handler(status="active", turns=turns))
+
+    accepted = await deliver_notification(event, transport, request_timeout=0.2)
+
+    assert accepted.turn_id == "active-turn"
+    assert transport.sent[-1]["params"]["expectedTurnId"] == "active-turn"
+
+
 @pytest.mark.parametrize(
     ("status", "turns"),
     [
         ("notLoaded", []),
         ("systemError", []),
         ("active", []),
-        ("active", [{"id": "a", "status": "inProgress"}, {"id": "b", "status": "inProgress"}]),
         ("idle", [{"id": "a", "status": "inProgress"}]),
     ],
 )
@@ -408,45 +495,36 @@ async def test_sweep_fails_after_maximum_attempts(tmp_path: Path) -> None:
 
 
 @run_async
-async def test_stdio_transport_integrates_with_fake_jsonl_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    server = tmp_path / "fake_server.py"
-    server.write_text(
-        "import json, sys\n"
-        "for line in sys.stdin:\n"
-        "    message = json.loads(line)\n"
-        "    print(json.dumps({'method': 'notice', 'params': {}}), flush=True)\n"
-        "    print(json.dumps({'id': message['id'], 'result': {'echo': message['method']}}), flush=True)\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        JsonlStdioTransport,
-        "command",
-        ("python", str(server)),
-    )
-    transport = await JsonlStdioTransport.connect(tmp_path / "daemon.sock")
-    async with RpcClient(transport, request_timeout=1) as client:
-        result = await client.request("initialize", {})
-
-    assert result == {"echo": "initialize"}
-
-
-@run_async
 async def test_unix_websocket_transport_integrates_with_fake_server(tmp_path: Path) -> None:
     websockets = pytest.importorskip("websockets.asyncio.server")
     socket_path = tmp_path / "app-server.sock"
+    request_headers: dict[str, str] = {}
 
     async def echo(websocket: Any) -> None:
+        request_headers.update(websocket.request.headers)
         message = json.loads(await websocket.recv())
-        await websocket.send(json.dumps({"id": message["id"], "result": {"ok": True}}))
+        await websocket.send(
+            json.dumps(
+                {
+                    "id": message["id"],
+                    "result": {"payload": "x" * (APP_SERVER_MESSAGE_LIMIT_BYTES // 4)},
+                }
+            )
+        )
 
-    async with websockets.unix_serve(echo, path=socket_path):
+    async with websockets.unix_serve(
+        echo,
+        path=socket_path,
+        compression=None,
+        server_header=None,
+    ):
         transport = await UnixWebSocketTransport.connect(socket_path)
         async with RpcClient(transport, request_timeout=1) as client:
             result = await client.request("initialize", {})
 
-    assert result == {"ok": True}
+    assert "sec-websocket-extensions" not in request_headers
+    assert "user-agent" not in request_headers
+    assert len(result["payload"]) == APP_SERVER_MESSAGE_LIMIT_BYTES // 4
 
 
 @run_async
@@ -489,6 +567,15 @@ def malformed_response_handler(fault: str) -> Callable[[dict[str, Any]], list[di
             elif fault == "missing-turns":
                 response_thread["turns"] = None
             return [{"id": request_id, "result": {"thread": response_thread}}]
+        if method == "thread/goal/get":
+            if fault == "invalid-goal":
+                return [{"id": request_id, "result": {"goal": {}}}]
+            return [
+                {
+                    "id": request_id,
+                    "result": {"goal": {"threadId": THREAD_ID, "status": "active"}},
+                }
+            ]
         if method == "turn/start":
             result: dict[str, Any] = {"turn": {"id": "new-turn"}}
             if fault == "bad-start":
@@ -503,6 +590,7 @@ def malformed_response_handler(fault: str) -> Callable[[dict[str, Any]], list[di
     ("fault", "message"),
     [
         ("resume-missing", "missing thread"),
+        ("invalid-goal", "invalid goal"),
         ("wrong-thread", "unexpected thread"),
         ("bad-status", "unknown thread status"),
         ("missing-turns", "missing turns"),
@@ -552,42 +640,6 @@ async def test_rpc_rejects_nonstandard_error_and_result(
     async with RpcClient(transport, request_timeout=0.2) as client:
         with pytest.raises(AppServerProtocolError, match=message):
             await client.request("test", {})
-
-
-@pytest.mark.parametrize("message", ["not-json", "[]", '{"id": 1, "result": 2}'])
-@run_async
-async def test_stdio_transport_rejects_invalid_messages(tmp_path: Path, message: str) -> None:
-    server = tmp_path / "bad_server.py"
-    server.write_text(
-        f"import sys\nsys.stdin.readline()\nprint({message!r}, flush=True)\n",
-        encoding="utf-8",
-    )
-    original = JsonlStdioTransport.command
-    JsonlStdioTransport.command = ("python", str(server))
-    try:
-        transport = await JsonlStdioTransport.connect()
-        async with RpcClient(transport, request_timeout=0.2) as client:
-            with pytest.raises(AppServerProtocolError):
-                await client.request("test", {})
-    finally:
-        JsonlStdioTransport.command = original
-
-
-@run_async
-async def test_stdio_transport_reports_proxy_eof(tmp_path: Path) -> None:
-    server = tmp_path / "closed_server.py"
-    server.write_text(
-        "import sys\nprint('daemon unavailable', file=sys.stderr)\n", encoding="utf-8"
-    )
-    original = JsonlStdioTransport.command
-    JsonlStdioTransport.command = ("python", str(server))
-    try:
-        transport = await JsonlStdioTransport.connect()
-        with pytest.raises(AppServerProtocolError, match="daemon unavailable"):
-            await transport.receive()
-        await transport.close()
-    finally:
-        JsonlStdioTransport.command = original
 
 
 @run_async
@@ -784,15 +836,9 @@ async def test_connector_factories_delegate_to_transport_classes(
 ) -> None:
     expected = ScriptedTransport(lambda _message: [])
 
-    async def stdio_connect(socket_path: Path | None = None) -> ScriptedTransport:
-        assert socket_path == tmp_path / "daemon.sock"
-        return expected
-
     async def unix_connect_fake(socket_path: Path) -> ScriptedTransport:
         assert socket_path == tmp_path / "daemon.sock"
         return expected
 
-    monkeypatch.setattr(JsonlStdioTransport, "connect", stdio_connect)
     monkeypatch.setattr(UnixWebSocketTransport, "connect", unix_connect_fake)
-    assert await stdio_connector(tmp_path / "daemon.sock")() is expected
     assert await unix_connector(tmp_path / "daemon.sock")() is expected

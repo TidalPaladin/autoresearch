@@ -227,7 +227,12 @@ When supported, resume the recorded thread with the Codex SDK or app-server and 
   Steering inherits the active turn's model and cannot switch it to Luna.
 - If status is unknown or changes during delivery, keep the event queued and retry after reading status again. Do not start a second concurrent turn.
 
-Serialize wake delivery per thread. Mark an event accepted only after `turn/start` or `turn/steer` accepts it. Prefer the SDK, stdio, or a Unix socket. Do not depend on the experimental non-loopback WebSocket transport.
+Before delivering the wake, query the originating thread's persistent goal. If
+its status is `blocked`, transition it to `active` so the lifecycle event can
+resume automatic continuation. Do not override `paused`, `complete`,
+`usageLimited`, or `budgetLimited`; a missing goal does not block delivery.
+
+Serialize wake delivery per thread. Mark an event accepted only after `turn/start` or `turn/steer` accepts it. Prefer the SDK or a local Unix socket. Do not depend on the experimental non-loopback WebSocket transport.
 
 Keep wake prompts small. Include identifiers and the event-state path, not raw logs, stack traces, or other untrusted run output. Re-read and validate persisted state before acting.
 

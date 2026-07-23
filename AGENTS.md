@@ -31,7 +31,7 @@ Use `uv==0.11.28`. Pin direct dependencies and commit `uv.lock`. Preserve Hatch 
 - Follow TDD. Add a failing regression or behavior test before production code.
 - Keep branch coverage at or above 90%.
 - Test state corruption, path escapes, crash windows, retries, protocol races, and I/O failures, not only successful delivery.
-- Use fake JSONL and WebSocket-over-Unix servers. Tests must not connect to or wake a real Codex task.
+- Use fake WebSocket-over-Unix servers. Tests must not connect to or wake a real Codex task.
 - Run tests on Python 3.12 and 3.14 for changes to the runtime or notifier.
 
 ## State safety
@@ -64,7 +64,8 @@ Notification failure must never change terminal training status. The runtime rec
 - Require an existing persistent Codex app-server daemon.
 - Do not start, restart, or stop the daemon from repository code.
 - Keep app-server communication out of training and supervisor processes.
-- Use `codex app-server proxy` for JSONL stdio or a local WebSocket-over-Unix connection.
+- Connect directly to the running daemon's local Unix socket, discovering it through `codex app-server daemon version` unless the operator supplies an explicit path.
+- Query the originating thread goal before a lifecycle wake. Transition only `blocked` goals to `active`; preserve `paused`, `complete`, `usageLimited`, and `budgetLimited` states.
 - Mark acceptance only after app-server accepts `turn/start` or `turn/steer`.
 - For an idle dedicated monitor turn, prefer a `turn/start` override of `model: gpt-5.6-luna` and `effort: medium`. A `turn/steer` request inherits the active turn's model.
 - Leave unknown states, turn races, protocol errors, and connection failures queued for bounded retry.

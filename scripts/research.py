@@ -6,14 +6,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NoReturn, TextIO, cast
 
 from project.research.codex_notifications import (
     SweepResult,
-    stdio_connector,
     sweep_notifications,
     unix_connector,
 )
@@ -78,7 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
     worker = commands.add_parser("notify-worker", help="deliver due queued events once")
     worker.add_argument("--once", action="store_true", required=True)
     worker.add_argument("--root", type=Path, default=Path("logs/research"))
-    worker.add_argument("--transport", choices=("stdio", "unix"), default="stdio")
     worker.add_argument("--socket", type=Path, help="daemon Unix socket path")
     _add_output_arguments(worker)
 
@@ -206,12 +206,7 @@ def _run_register_root(arguments: argparse.Namespace) -> int:
 
 
 async def _run_worker_async(arguments: argparse.Namespace) -> int:
-    if arguments.transport == "unix":
-        if arguments.socket is None:
-            raise InvocationError("--socket is required with --transport unix")
-        connector = unix_connector(arguments.socket)
-    else:
-        connector = stdio_connector(arguments.socket)
+    connector = unix_connector(resolve_daemon_socket(arguments.socket))
     result = await sweep_notifications(arguments.root, connect=connector)
     options = _output_options(arguments)
     _render_sweep(result, options, sys.stdout)
@@ -219,6 +214,40 @@ async def _run_worker_async(arguments: argparse.Namespace) -> int:
         for problem in result.problems:
             print(f"research warning: {problem}", file=sys.stderr)
     return result.exit_code
+
+
+def _daemon_version_output() -> str:
+    result = subprocess.run(
+        ("codex", "app-server", "daemon", "version"),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not inspect the Codex app-server daemon")
+    return result.stdout
+
+
+def resolve_daemon_socket(
+    explicit_socket: Path | None,
+    *,
+    daemon_version: Callable[[], str] = _daemon_version_output,
+) -> Path:
+    """Resolve the running daemon's Unix control socket."""
+    if explicit_socket is not None:
+        return explicit_socket.expanduser().resolve(strict=False)
+    try:
+        payload = json.loads(daemon_version())
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Codex daemon version output is not valid JSON") from error
+    socket_path = (
+        payload.get("socketPath")
+        if isinstance(payload, dict) and payload.get("status") == "running"
+        else None
+    )
+    if not isinstance(socket_path, str) or not socket_path or not Path(socket_path).is_absolute():
+        raise RuntimeError("Codex app-server daemon did not report an absolute running socket path")
+    return Path(socket_path).resolve(strict=False)
 
 
 def _runtime_failure(message: str) -> NoReturn:

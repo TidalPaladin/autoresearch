@@ -139,42 +139,36 @@ The helper stores internal HTML-comment metadata with each complete Markdown blo
 
 Repository code requires an existing daemon. It never starts, restarts, or stops app-server. The operator owns daemon lifecycle and authentication.
 
-With Codex CLI 0.144.5, start and inspect the managed local daemon outside this repository:
+With Codex CLI 0.145.0, start and inspect the managed local daemon outside this repository:
 
 ```bash
 codex app-server daemon start
 codex app-server daemon version
 ```
 
-The implementation baseline is app-server schema 0.144.5. Later compatible versions can work, but unknown statuses, fields, protocol errors, and lifecycle races remain queued instead of being guessed around. Review the current [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server.md) before changing the client.
+The implementation baseline is app-server schema 0.145.0, including the
+persistent-goal APIs used to reactivate blocked research goals. Later compatible
+versions can work, but unknown statuses, fields, protocol errors, and lifecycle
+races remain queued instead of being guessed around. Review the current
+[Codex App Server documentation](https://learn.chatgpt.com/docs/app-server.md)
+before changing the client.
 
-## Deliver through the stdio proxy
+## Deliver through the daemon Unix socket
 
-The default transport launches a short-lived `codex app-server proxy` process. The proxy carries JSONL between this worker and the existing daemon control socket. Closing the proxy does not stop the daemon.
+The worker connects directly with a WebSocket handshake over the daemon's
+local Unix socket. By default it discovers the running socket through
+`codex app-server daemon version`:
 
 ```bash
 uv run python scripts/research.py notify-worker --once \
-  --root logs/research \
-  --transport stdio
+  --root logs/research
 ```
 
-Use `--socket /absolute/path/to/app-server.sock` to select a non-default daemon socket.
-
-## Deliver through a Unix socket
-
-The Unix transport connects directly with a WebSocket handshake over the local Unix socket. Read the managed socket path from the daemon and pass it explicitly:
-
-```bash
-APP_SERVER_SOCKET="$(codex app-server daemon version | \
-  uv run python -c 'import json, sys; print(json.load(sys.stdin)["socketPath"])')"
-
-uv run python scripts/research.py notify-worker --once \
-  --root logs/research \
-  --transport unix \
-  --socket "$APP_SERVER_SOCKET"
-```
-
-Prefer stdio or a local Unix socket. Do not expose an unauthenticated app-server listener on a shared or public network. TCP WebSocket support is experimental and is not implemented by this template.
+Use `--socket /absolute/path/to/app-server.sock` to select a non-default daemon
+socket. The client disables WebSocket compression and the user-agent header and
+accepts app-server messages up to 16 MiB. Do not expose an unauthenticated
+app-server listener on a shared or public network. TCP WebSocket support is
+experimental and is not implemented by this template.
 
 ## CLI behavior
 
@@ -196,7 +190,6 @@ Process each due current event at most once:
 ```bash
 uv run python scripts/research.py notify-worker --once \
   [--root logs/research] \
-  [--transport stdio|unix] \
   [--socket PATH]
 ```
 
@@ -217,14 +210,20 @@ Exit codes are:
 | State | Worker action | Next state |
 | --- | --- | --- |
 | `pending`, not due | Skip this sweep | `pending` |
+| `pending`, blocked goal | Set the goal to `active`, then deliver by task state | Continue below |
 | `pending`, idle task | Send `turn/start` | `accepted` after the response |
-| `pending`, one active turn | Send `turn/steer` with its expected turn ID | `accepted` after the response |
+| `pending`, active task | Send `turn/steer` with the newest in-progress turn's expected ID | `accepted` after the response |
 | `pending`, connection or protocol failure | Record one attempt and full-jitter backoff | `pending` |
 | `pending`, permanently invalid or eighth failed attempt | Stop automatic delivery | `failed` |
 | `failed`, explicit `notify --requeue` | Reset delivery metadata | `pending` |
 | `accepted` | Deduplicate by event ID under the task lock | `accepted` |
 
 Backoff starts at 5 seconds, doubles per attempt, caps at 300 seconds, and uses full jitter. Each worker sweep records at most one attempt per due event. Acceptance is also recorded in a per-task ledger, and the event ID is sent as `clientUserMessageId` for app-server deduplication.
+
+Before waking the task, the worker queries its persistent goal. It reactivates
+only a `blocked` goal. Explicit `paused`, `complete`, `usageLimited`, and
+`budgetLimited` states are preserved, and a task without a goal is still
+deliverable.
 
 The wake message contains only validated identifiers, terminal status, and the absolute `terminal.json` path:
 
@@ -303,7 +302,7 @@ changes and studies that are still active.
 - Never put secrets, raw samples, logs, stack traces, or training output in a wake prompt.
 - Never let notification delivery change a terminal training result.
 - Never let the training process wait for Codex availability.
-- Use fake JSONL and Unix-socket servers in tests. Automated tests must not resume, steer, or wake a real Codex task.
+- Use fake Unix-socket servers in tests. Automated tests must not resume, steer, or wake a real Codex task.
 - Do not add daemon lifecycle management to the training process, supervisor, or notification worker.
 
 ## Downstream adapter contract

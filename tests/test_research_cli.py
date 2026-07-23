@@ -15,8 +15,47 @@ from project.research.runtime import (
     register_managed_root,
     write_notification_event,
 )
+from scripts.research import resolve_daemon_socket
 
 THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
+
+
+def test_daemon_socket_resolution_prefers_explicit_path(tmp_path: Path) -> None:
+    socket_path = tmp_path / "daemon.sock"
+
+    resolved = resolve_daemon_socket(
+        socket_path,
+        daemon_version=lambda: (_ for _ in ()).throw(AssertionError("must not inspect daemon")),
+    )
+
+    assert resolved == socket_path.resolve()
+
+
+def test_daemon_socket_resolution_discovers_running_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "daemon.sock"
+
+    resolved = resolve_daemon_socket(
+        None,
+        daemon_version=lambda: json.dumps({"status": "running", "socketPath": str(socket_path)}),
+    )
+
+    assert resolved == socket_path.resolve()
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("not-json", "not valid JSON"),
+        (json.dumps({"status": "stopped"}), "absolute running socket"),
+        (
+            json.dumps({"status": "running", "socketPath": "relative.sock"}),
+            "absolute running socket",
+        ),
+    ],
+)
+def test_daemon_socket_resolution_rejects_invalid_daemon_state(payload: str, message: str) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        resolve_daemon_socket(None, daemon_version=lambda: payload)
 
 
 def run_cli(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -141,6 +180,8 @@ def test_worker_empty_sweep_is_deterministic_json(tmp_path: Path) -> None:
         "--once",
         "--root",
         str(tmp_path / "missing"),
+        "--socket",
+        str(tmp_path / "daemon.sock"),
         "--format",
         "json",
     )
@@ -158,12 +199,12 @@ def test_worker_empty_sweep_is_deterministic_json(tmp_path: Path) -> None:
     }
 
 
-def test_worker_unix_transport_requires_socket(tmp_path: Path) -> None:
+def test_worker_rejects_removed_transport_flag(tmp_path: Path) -> None:
     result = run_cli(tmp_path, "notify-worker", "--once", "--transport", "unix")
 
     assert result.returncode == 2
     assert result.stdout == ""
-    assert "--socket is required" in result.stderr
+    assert "unrecognized arguments" in result.stderr
 
 
 def test_worker_delivery_problem_uses_exit_one_and_clean_json(tmp_path: Path) -> None:
@@ -178,6 +219,8 @@ def test_worker_delivery_problem_uses_exit_one_and_clean_json(tmp_path: Path) ->
         "--once",
         "--root",
         str(tmp_path / "logs"),
+        "--socket",
+        str(tmp_path / "daemon.sock"),
         "--format",
         "json",
     )

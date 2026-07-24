@@ -103,7 +103,7 @@ async def persist_launch_wake_context(study, run_id, socket_path):
     transport = await UnixWebSocketTransport.connect(socket_path)
     wake_context = await capture_wake_context(
         thread_id=os.environ["CODEX_THREAD_ID"],
-        expected_permission_profile=os.environ.get("CODEX_PERMISSION_PROFILE"),
+        requested_permission_profile=os.environ.get("CODEX_PERMISSION_PROFILE"),
         transport=transport,
     )
     persist_wake_context(study, run_id, wake_context)
@@ -112,11 +112,13 @@ async def persist_launch_wake_context(study, run_id, socket_path):
 
 The notifier passes the recorded profile and approval policy to
 `thread/resume`, verifies the returned effective values, and applies the same
-values to `turn/start`. An explicit `activePermissionProfile: null` is persisted
-when the originating task has no named profile; the `permissions` override is
-then omitted on resume. Verification happens before a blocked goal can be
-reactivated. A missing field or any mismatch fails delivery permanently; the
-worker does not choose an implicit or broader profile.
+values to `turn/start`. When `CODEX_PERMISSION_PROFILE` is unset, capture omits
+the override and persists the non-null profile ID resolved by app-server,
+including an implicit built-in ID. A missing or null effective profile fails
+before dispatch. Verification happens before a blocked goal can be reactivated.
+A legacy null-profile context requires explicit recovery, and a missing field or
+any mismatch fails delivery permanently. The worker never maps a legacy context
+to the current default or chooses a broader profile.
 
 ## Record terminal state from project code
 

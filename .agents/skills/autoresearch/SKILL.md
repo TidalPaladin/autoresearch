@@ -187,11 +187,16 @@ Keep artifacts needed for the baseline, confirmed results, retries, audits, and 
 
 Run jobs under a detached supervisor or another recoverable process. Before
 launch, capture the originating Codex thread's effective permission-profile
-identity and approval policy while that thread is live. Persist JSON `null`
-when app-server explicitly reports no named profile. Persist those values, the
-thread identifier, and the capture time as an immutable wake context in the
-managed run directory before child spawn. Do not infer a profile from defaults,
-hardcode a broader profile, or replace a run's recorded wake context.
+identity and approval policy while that thread is live. Treat an explicitly
+configured profile as a requested constraint: select it and require app-server
+to return the same identifier. When no profile is configured, omit the override
+and discover the effective profile from app-server. Require a non-null
+`activePermissionProfile.id`, including when app-server resolves an implicit
+built-in profile. Persist the returned identifier, approval policy, thread
+identifier, and capture time as an immutable wake context in the managed run
+directory before child spawn. Fail before dispatch if app-server cannot report
+a selectable profile. Do not infer a profile from defaults, hardcode a broader
+profile, or replace a run's recorded wake context.
 
 After child spawn, make the supervisor own the child process group until every child is reaped. On heartbeat failure, state-write failure, cancellation, interrupt, timeout, or any other exceptional supervisor exit, terminate the process group, escalate when graceful termination does not complete, and reap every child before releasing GPU or other resource locks. Surface cleanup failure and keep the resource lock while an owned child may still be running.
 
@@ -233,11 +238,12 @@ Require every deliverable event to resolve to the immutable wake context
 captured before its run started. Resume the originating thread with that exact
 permission-profile identity and approval policy, then verify the effective
 profile and policy returned by app-server before querying or changing the
-persistent goal. Apply the same context to `turn/start`. An explicit
-`activePermissionProfile: null` matches only a captured null profile. Missing
-context, an absent effective-permission field, or any mismatch is a permanent
-delivery failure that requires explicit recovery. Never fall back to app-server
-defaults or broaden access to make a wake succeed.
+persistent goal. Apply the same context to `turn/start`. A legacy wake context
+with a null profile requires explicit recovery and must never be mapped to the
+current default. Missing context, an absent or null effective-permission field,
+or any mismatch is a permanent delivery failure that requires explicit
+recovery. Never fall back to app-server defaults or broaden access to make a
+wake succeed.
 
 When supported, resume the recorded thread with the Codex SDK or app-server and inspect its runtime status. App-server clients may use `thread/resume` and `thread/read`; see [Codex App Server](https://developers.openai.com/codex/app-server/). Deliver the wake input according to thread state:
 

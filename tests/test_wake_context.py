@@ -30,7 +30,7 @@ def test_standard_wake_context_round_trips_and_builds_resume_params() -> None:
     }
 
 
-def test_unnamed_permission_profile_round_trips_without_resume_override() -> None:
+def test_legacy_unnamed_permission_profile_round_trips_without_resume_override() -> None:
     context = WakeContext(
         thread_id="thread-a",
         permission_profile=None,

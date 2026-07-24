@@ -272,7 +272,6 @@ def _wake_context_from_resume(
     result: JsonObject,
     *,
     thread_id: str,
-    expected_permission_profile: str | None,
     captured_at: datetime,
 ) -> WakeContext:
     if "activePermissionProfile" not in result:
@@ -282,20 +281,16 @@ def _wake_context_from_resume(
         )
     active_profile = result["activePermissionProfile"]
     if active_profile is None:
-        profile_id = None
-    elif isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
-        profile_id = active_profile["id"]
-    else:
+        raise AppServerProtocolError(
+            "thread/resume did not report a selectable effective permission profile",
+            permanent=True,
+        )
+    if not isinstance(active_profile, dict) or not isinstance(active_profile.get("id"), str):
         raise AppServerProtocolError(
             "thread/resume returned an invalid effective permission profile",
             permanent=True,
         )
-    if profile_id != expected_permission_profile:
-        raise AppServerProtocolError(
-            "thread/resume permission profile mismatch: "
-            f"expected {expected_permission_profile!r}, received {profile_id!r}",
-            permanent=True,
-        )
+    profile_id = active_profile["id"]
     if "approvalPolicy" not in result:
         raise AppServerProtocolError(
             "thread/resume response is missing the effective approval policy",
@@ -304,7 +299,7 @@ def _wake_context_from_resume(
     try:
         return WakeContext(
             thread_id=thread_id,
-            permission_profile=expected_permission_profile,
+            permission_profile=profile_id,
             approval_policy=result["approvalPolicy"],
             captured_at=captured_at,
         )
@@ -315,10 +310,19 @@ def _wake_context_from_resume(
         ) from error
 
 
+def _require_permission_profile(actual: WakeContext, expected: str) -> None:
+    if actual.permission_profile != expected:
+        raise AppServerProtocolError(
+            "thread/resume permission profile mismatch: "
+            f"expected {expected!r}, received {actual.permission_profile!r}",
+            permanent=True,
+        )
+
+
 async def capture_wake_context(
     *,
     thread_id: str,
-    expected_permission_profile: str | None,
+    requested_permission_profile: str | None,
     transport: MessageTransport,
     captured_at: datetime | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -329,16 +333,18 @@ async def capture_wake_context(
         await client.request("initialize", _initialize_params())
         await client.notify("initialized", {})
         resume_params: JsonObject = {"threadId": thread_id}
-        if expected_permission_profile is not None:
-            resume_params["permissions"] = expected_permission_profile
+        if requested_permission_profile is not None:
+            resume_params["permissions"] = requested_permission_profile
         resumed = await client.request("thread/resume", resume_params)
         _thread_from_result(resumed, "thread/resume", thread_id)
-        return _wake_context_from_resume(
+        context = _wake_context_from_resume(
             resumed,
             thread_id=thread_id,
-            expected_permission_profile=expected_permission_profile,
             captured_at=selected_at,
         )
+        if requested_permission_profile is not None:
+            _require_permission_profile(context, requested_permission_profile)
+        return context
 
 
 async def _resume_blocked_goal(client: RpcClient, thread_id: str) -> None:
@@ -381,6 +387,13 @@ async def deliver_notification(
             "notification has no captured wake permission context",
             permanent=True,
         )
+    if wake_context.permission_profile is None:
+        await transport.close()
+        raise AppServerProtocolError(
+            "notification uses a legacy wake context without a selectable permission profile; "
+            "explicit recovery is required",
+            permanent=True,
+        )
 
     async with RpcClient(transport, request_timeout=request_timeout) as client:
         await client.request("initialize", _initialize_params())
@@ -390,9 +403,9 @@ async def deliver_notification(
         resumed_context = _wake_context_from_resume(
             resumed,
             thread_id=thread_id,
-            expected_permission_profile=wake_context.permission_profile,
             captured_at=wake_context.captured_at,
         )
+        _require_permission_profile(resumed_context, wake_context.permission_profile)
         if resumed_context.approval_policy != wake_context.approval_policy:
             raise AppServerProtocolError(
                 "thread/resume approval policy mismatch",

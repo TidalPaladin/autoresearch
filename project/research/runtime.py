@@ -745,6 +745,8 @@ def persist_wake_context(
     context: WakeContext,
 ) -> Path:
     """Persist one immutable permission context before dispatching a managed run."""
+    if context.permission_profile is None:
+        raise StateValidationError("new wake context must include a selectable permission profile")
     register_managed_root(study.log_root)
     run_dir = study.run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)

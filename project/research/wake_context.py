@@ -30,6 +30,12 @@ def _validated_text(value: object, field_name: str) -> str:
     return value
 
 
+def _validated_permission_profile(value: object) -> str | None:
+    if value is None:
+        return None
+    return _validated_text(value, "permission_profile")
+
+
 def _normalized_datetime(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise WakeContextValidationError(f"{field_name} must include a UTC offset")
@@ -104,7 +110,7 @@ class WakeContext:
     """The effective app-server authority captured before a managed run starts."""
 
     thread_id: str
-    permission_profile: str
+    permission_profile: str | None
     approval_policy: ApprovalPolicyInput
     captured_at: datetime
 
@@ -113,7 +119,7 @@ class WakeContext:
         object.__setattr__(
             self,
             "permission_profile",
-            _validated_text(self.permission_profile, "permission_profile"),
+            _validated_permission_profile(self.permission_profile),
         )
         object.__setattr__(
             self,
@@ -139,10 +145,7 @@ class WakeContext:
             raise WakeContextValidationError("captured_at must be an ISO 8601 string") from error
         return cls(
             thread_id=_validated_text(value["thread_id"], "thread_id"),
-            permission_profile=_validated_text(
-                value["permission_profile"],
-                "permission_profile",
-            ),
+            permission_profile=_validated_permission_profile(value["permission_profile"]),
             approval_policy=normalize_approval_policy(value["approval_policy"]),
             captured_at=parsed_at,
         )
@@ -158,8 +161,10 @@ class WakeContext:
 
     def resume_params(self) -> dict[str, Any]:
         approval_policy = cast(ApprovalPolicy, self.approval_policy)
-        return {
+        params = {
             "threadId": self.thread_id,
-            "permissions": self.permission_profile,
             "approvalPolicy": approval_policy_payload(approval_policy),
         }
+        if self.permission_profile is not None:
+            params["permissions"] = self.permission_profile
+        return params

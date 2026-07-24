@@ -30,6 +30,22 @@ def test_standard_wake_context_round_trips_and_builds_resume_params() -> None:
     }
 
 
+def test_unnamed_permission_profile_round_trips_without_resume_override() -> None:
+    context = WakeContext(
+        thread_id="thread-a",
+        permission_profile=None,
+        approval_policy="never",
+        captured_at=CAPTURED_AT,
+    )
+
+    assert WakeContext.from_dict(context.to_dict()) == context
+    assert context.to_dict()["permission_profile"] is None
+    assert context.resume_params() == {
+        "threadId": "thread-a",
+        "approvalPolicy": "never",
+    }
+
+
 def test_granular_approval_policy_is_normalized_and_round_trips() -> None:
     context = WakeContext(
         thread_id="thread-a",

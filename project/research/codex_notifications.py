@@ -272,11 +272,24 @@ def _wake_context_from_resume(
     result: JsonObject,
     *,
     thread_id: str,
-    expected_permission_profile: str,
+    expected_permission_profile: str | None,
     captured_at: datetime,
 ) -> WakeContext:
-    active_profile = result.get("activePermissionProfile")
-    profile_id = active_profile.get("id") if isinstance(active_profile, dict) else None
+    if "activePermissionProfile" not in result:
+        raise AppServerProtocolError(
+            "thread/resume response is missing the effective permission profile",
+            permanent=True,
+        )
+    active_profile = result["activePermissionProfile"]
+    if active_profile is None:
+        profile_id = None
+    elif isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
+        profile_id = active_profile["id"]
+    else:
+        raise AppServerProtocolError(
+            "thread/resume returned an invalid effective permission profile",
+            permanent=True,
+        )
     if profile_id != expected_permission_profile:
         raise AppServerProtocolError(
             "thread/resume permission profile mismatch: "
@@ -305,7 +318,7 @@ def _wake_context_from_resume(
 async def capture_wake_context(
     *,
     thread_id: str,
-    expected_permission_profile: str,
+    expected_permission_profile: str | None,
     transport: MessageTransport,
     captured_at: datetime | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -315,13 +328,10 @@ async def capture_wake_context(
     async with RpcClient(transport, request_timeout=request_timeout) as client:
         await client.request("initialize", _initialize_params())
         await client.notify("initialized", {})
-        resumed = await client.request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "permissions": expected_permission_profile,
-            },
-        )
+        resume_params: JsonObject = {"threadId": thread_id}
+        if expected_permission_profile is not None:
+            resume_params["permissions"] = expected_permission_profile
+        resumed = await client.request("thread/resume", resume_params)
         _thread_from_result(resumed, "thread/resume", thread_id)
         return _wake_context_from_resume(
             resumed,

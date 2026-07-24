@@ -103,7 +103,7 @@ async def persist_launch_wake_context(study, run_id, socket_path):
     transport = await UnixWebSocketTransport.connect(socket_path)
     wake_context = await capture_wake_context(
         thread_id=os.environ["CODEX_THREAD_ID"],
-        expected_permission_profile=os.environ["CODEX_PERMISSION_PROFILE"],
+        expected_permission_profile=os.environ.get("CODEX_PERMISSION_PROFILE"),
         transport=transport,
     )
     persist_wake_context(study, run_id, wake_context)
@@ -112,8 +112,10 @@ async def persist_launch_wake_context(study, run_id, socket_path):
 
 The notifier passes the recorded profile and approval policy to
 `thread/resume`, verifies the returned effective values, and applies the same
-values to `turn/start`. Verification happens before a blocked goal can be
-reactivated. Missing context or any mismatch fails delivery permanently; the
+values to `turn/start`. An explicit `activePermissionProfile: null` is persisted
+when the originating task has no named profile; the `permissions` override is
+then omitted on resume. Verification happens before a blocked goal can be
+reactivated. A missing field or any mismatch fails delivery permanently; the
 worker does not choose an implicit or broader profile.
 
 ## Record terminal state from project code

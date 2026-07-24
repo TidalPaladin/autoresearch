@@ -186,9 +186,10 @@ Keep artifacts needed for the baseline, confirmed results, retries, audits, and 
 ## Launch and persistent state
 
 Run jobs under a detached supervisor or another recoverable process. Before
-launch, capture the originating Codex thread's effective named permission
-profile and approval policy while that thread is live. Persist those values,
-the thread identifier, and the capture time as an immutable wake context in the
+launch, capture the originating Codex thread's effective permission-profile
+identity and approval policy while that thread is live. Persist JSON `null`
+when app-server explicitly reports no named profile. Persist those values, the
+thread identifier, and the capture time as an immutable wake context in the
 managed run directory before child spawn. Do not infer a profile from defaults,
 hardcode a broader profile, or replace a run's recorded wake context.
 
@@ -230,12 +231,13 @@ Require the supervisor to write terminal state before notifying Codex. Add a dom
 
 Require every deliverable event to resolve to the immutable wake context
 captured before its run started. Resume the originating thread with that exact
-named permission profile and approval policy, then verify the effective profile
-and policy returned by app-server before querying or changing the persistent
-goal. Apply the same context to `turn/start`. Missing context, a response that
-omits effective permission state, or any mismatch is a permanent delivery
-failure that requires explicit recovery. Never fall back to app-server defaults
-or broaden access to make a wake succeed.
+permission-profile identity and approval policy, then verify the effective
+profile and policy returned by app-server before querying or changing the
+persistent goal. Apply the same context to `turn/start`. An explicit
+`activePermissionProfile: null` matches only a captured null profile. Missing
+context, an absent effective-permission field, or any mismatch is a permanent
+delivery failure that requires explicit recovery. Never fall back to app-server
+defaults or broaden access to make a wake succeed.
 
 When supported, resume the recorded thread with the Codex SDK or app-server and inspect its runtime status. App-server clients may use `thread/resume` and `thread/read`; see [Codex App Server](https://developers.openai.com/codex/app-server/). Deliver the wake input according to thread state:
 

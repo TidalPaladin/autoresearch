@@ -121,7 +121,7 @@ def app_server_handler(
     turns: list[dict[str, Any]],
     steer_error: bool = False,
     goal_status: str | None = "active",
-    permission_profile: str = PERMISSION_PROFILE,
+    permission_profile: str | None = PERMISSION_PROFILE,
     approval_policy: str = APPROVAL_POLICY,
 ) -> Callable[[dict[str, Any]], list[dict[str, Any]]]:
     experimental_api = False
@@ -158,7 +158,9 @@ def app_server_handler(
                     "id": request_id,
                     "result": {
                         "thread": thread(status, turns),
-                        "activePermissionProfile": {"id": permission_profile},
+                        "activePermissionProfile": (
+                            {"id": permission_profile} if permission_profile is not None else None
+                        ),
                         "approvalPolicy": approval_policy,
                     },
                 }
@@ -222,6 +224,48 @@ async def test_capture_wake_context_records_effective_profile_and_approval_polic
         "threadId": THREAD_ID,
         "permissions": PERMISSION_PROFILE,
     }
+
+
+@run_async
+async def test_capture_wake_context_records_explicitly_unnamed_permission_profile() -> None:
+    transport = ScriptedTransport(
+        app_server_handler(status="active", turns=[], permission_profile=None)
+    )
+
+    context = await capture_wake_context(
+        thread_id=THREAD_ID,
+        expected_permission_profile=None,
+        transport=transport,
+        captured_at=NOW,
+    )
+
+    assert context.permission_profile is None
+    assert context.approval_policy == APPROVAL_POLICY
+    resume = next(message for message in transport.sent if message.get("method") == "thread/resume")
+    assert resume["params"] == {"threadId": THREAD_ID}
+
+
+@run_async
+async def test_capture_wake_context_rejects_missing_permission_profile_field() -> None:
+    base_handler = app_server_handler(status="active", turns=[], permission_profile=None)
+
+    def handler(message: dict[str, Any]) -> list[dict[str, Any]]:
+        responses = base_handler(message)
+        if message.get("method") == "thread/resume":
+            del responses[0]["result"]["activePermissionProfile"]
+        return responses
+
+    with pytest.raises(
+        AppServerProtocolError, match="missing the effective permission profile"
+    ) as error:
+        await capture_wake_context(
+            thread_id=THREAD_ID,
+            expected_permission_profile=None,
+            transport=ScriptedTransport(handler),
+            captured_at=NOW,
+        )
+
+    assert error.value.permanent
 
 
 @run_async

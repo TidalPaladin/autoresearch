@@ -20,6 +20,7 @@ from project.research.codex_notifications import (
     RpcClient,
     UnixWebSocketTransport,
     build_wake_prompt,
+    capture_wake_context,
     deliver_notification,
     notification_lock_path,
     sweep_notifications,
@@ -29,17 +30,27 @@ from project.research.runtime import (
     NotificationEvent,
     StateValidationError,
     StudyConfig,
+    persist_wake_context,
     read_notification_event,
     record_terminal_event,
     register_managed_root,
     write_notification_event,
 )
+from project.research.wake_context import WakeContext
 
 EVENT_ID = "12345678-1234-5678-9234-567812345678"
 THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
 EXPECTED_WAKE_MODEL = "gpt-5.6-luna"
 EXPECTED_WAKE_EFFORT = "medium"
+PERMISSION_PROFILE = ":danger-full-access"
+APPROVAL_POLICY = "never"
 NOW = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+WAKE_CONTEXT = WakeContext(
+    thread_id=THREAD_ID,
+    permission_profile=PERMISSION_PROFILE,
+    approval_policy=APPROVAL_POLICY,
+    captured_at=NOW,
+)
 
 
 def run_async[**P](function: Callable[P, Coroutine[Any, Any, None]]) -> Callable[P, None]:
@@ -87,6 +98,7 @@ class GatedStartTransport(ScriptedTransport):
 
 def notification(tmp_path: Path) -> NotificationEvent:
     study = StudyConfig(id="study-a", log_root=tmp_path / "logs")
+    persist_wake_context(study, "run-a", WAKE_CONTEXT)
     _, event = record_terminal_event(
         study,
         "run-a",
@@ -99,6 +111,19 @@ def notification(tmp_path: Path) -> NotificationEvent:
     return event
 
 
+def test_new_wake_context_requires_selectable_permission_profile(tmp_path: Path) -> None:
+    study = StudyConfig(id="study-a", log_root=tmp_path / "logs")
+    legacy_context = WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=None,
+        approval_policy=APPROVAL_POLICY,
+        captured_at=NOW,
+    )
+
+    with pytest.raises(StateValidationError, match="selectable permission profile"):
+        persist_wake_context(study, "run-a", legacy_context)
+
+
 def thread(status: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
     return {"id": THREAD_ID, "status": {"type": status}, "turns": turns}
 
@@ -109,17 +134,50 @@ def app_server_handler(
     turns: list[dict[str, Any]],
     steer_error: bool = False,
     goal_status: str | None = "active",
+    permission_profile: str | None = PERMISSION_PROFILE,
+    approval_policy: str = APPROVAL_POLICY,
 ) -> Callable[[dict[str, Any]], list[dict[str, Any]]]:
+    experimental_api = False
+
     def handle(message: dict[str, Any]) -> list[dict[str, Any]]:
+        nonlocal experimental_api
         if "id" not in message:
             return []
         request_id = message["id"]
         method = message["method"]
         interleaved = {"method": "thread/status/changed", "params": {}}
         if method == "initialize":
+            experimental_api = (
+                message["params"].get("capabilities", {}).get("experimentalApi") is True
+            )
             return [interleaved, {"id": request_id, "result": {"userAgent": "fake"}}]
+        if (
+            method == "thread/resume"
+            and message["params"].get("permissions")
+            and not experimental_api
+        ):
+            return [
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32600,
+                        "message": "thread/resume.permissions requires experimentalApi capability",
+                    },
+                }
+            ]
         if method == "thread/resume":
-            return [{"id": request_id, "result": {"thread": thread(status, turns)}}]
+            return [
+                {
+                    "id": request_id,
+                    "result": {
+                        "thread": thread(status, turns),
+                        "activePermissionProfile": (
+                            {"id": permission_profile} if permission_profile is not None else None
+                        ),
+                        "approvalPolicy": approval_policy,
+                    },
+                }
+            ]
         if method == "thread/read":
             return [{"id": request_id, "result": {"thread": thread(status, turns)}}]
         if method == "thread/goal/get":
@@ -159,6 +217,89 @@ def app_server_handler(
 
 
 @run_async
+async def test_capture_wake_context_records_effective_profile_and_approval_policy() -> None:
+    transport = ScriptedTransport(app_server_handler(status="active", turns=[]))
+
+    context = await capture_wake_context(
+        thread_id=THREAD_ID,
+        requested_permission_profile=PERMISSION_PROFILE,
+        transport=transport,
+        captured_at=NOW,
+    )
+
+    assert context == WAKE_CONTEXT
+    initialize = next(
+        message for message in transport.sent if message.get("method") == "initialize"
+    )
+    assert initialize["params"]["capabilities"] == {"experimentalApi": True}
+    resume = next(message for message in transport.sent if message.get("method") == "thread/resume")
+    assert resume["params"] == {
+        "threadId": THREAD_ID,
+        "permissions": PERMISSION_PROFILE,
+    }
+
+
+@run_async
+async def test_capture_wake_context_discovers_implicit_permission_profile() -> None:
+    transport = ScriptedTransport(app_server_handler(status="active", turns=[]))
+
+    context = await capture_wake_context(
+        thread_id=THREAD_ID,
+        requested_permission_profile=None,
+        transport=transport,
+        captured_at=NOW,
+    )
+
+    assert context == WAKE_CONTEXT
+    resume = next(message for message in transport.sent if message.get("method") == "thread/resume")
+    assert resume["params"] == {"threadId": THREAD_ID}
+
+
+@run_async
+async def test_capture_wake_context_rejects_unselectable_permission_profile() -> None:
+    transport = ScriptedTransport(
+        app_server_handler(status="active", turns=[], permission_profile=None)
+    )
+
+    with pytest.raises(
+        AppServerProtocolError, match="selectable effective permission profile"
+    ) as error:
+        await capture_wake_context(
+            thread_id=THREAD_ID,
+            requested_permission_profile=None,
+            transport=transport,
+            captured_at=NOW,
+        )
+
+    assert error.value.permanent
+    resume = next(message for message in transport.sent if message.get("method") == "thread/resume")
+    assert resume["params"] == {"threadId": THREAD_ID}
+
+
+@run_async
+async def test_capture_wake_context_rejects_missing_permission_profile_field() -> None:
+    base_handler = app_server_handler(status="active", turns=[], permission_profile=None)
+
+    def handler(message: dict[str, Any]) -> list[dict[str, Any]]:
+        responses = base_handler(message)
+        if message.get("method") == "thread/resume":
+            del responses[0]["result"]["activePermissionProfile"]
+        return responses
+
+    with pytest.raises(
+        AppServerProtocolError, match="missing the effective permission profile"
+    ) as error:
+        await capture_wake_context(
+            thread_id=THREAD_ID,
+            requested_permission_profile=None,
+            transport=ScriptedTransport(handler),
+            captured_at=NOW,
+        )
+
+    assert error.value.permanent
+
+
+@run_async
 async def test_blocked_goal_is_resumed_before_wake(tmp_path: Path) -> None:
     event = notification(tmp_path)
     transport = ScriptedTransport(
@@ -167,6 +308,14 @@ async def test_blocked_goal_is_resumed_before_wake(tmp_path: Path) -> None:
 
     await deliver_notification(event, transport, request_timeout=0.2)
 
+    methods = [message.get("method") for message in transport.sent]
+    assert methods.index("thread/resume") < methods.index("thread/goal/set")
+    resume = next(message for message in transport.sent if message.get("method") == "thread/resume")
+    assert resume["params"] == {
+        "threadId": THREAD_ID,
+        "permissions": PERMISSION_PROFILE,
+        "approvalPolicy": APPROVAL_POLICY,
+    }
     goal_set = next(
         message for message in transport.sent if message.get("method") == "thread/goal/set"
     )
@@ -221,8 +370,55 @@ async def test_idle_thread_starts_turn_after_fresh_read(tmp_path: Path) -> None:
     assert start["input"] == [{"type": "text", "text": build_wake_prompt(event)}]
     assert start["model"] == EXPECTED_WAKE_MODEL
     assert start["effort"] == EXPECTED_WAKE_EFFORT
+    assert start["permissions"] == PERMISSION_PROFILE
+    assert start["approvalPolicy"] == APPROVAL_POLICY
     assert accepted.rpc_method == "turn/start"
     assert accepted.turn_id == "new-turn"
+
+
+@run_async
+async def test_profile_mismatch_fails_before_goal_reactivation(tmp_path: Path) -> None:
+    event = notification(tmp_path)
+    transport = ScriptedTransport(
+        app_server_handler(
+            status="idle",
+            turns=[],
+            goal_status="blocked",
+            permission_profile=":workspace",
+        )
+    )
+
+    with pytest.raises(AppServerProtocolError, match="permission profile mismatch") as error:
+        await deliver_notification(event, transport, request_timeout=0.2)
+
+    assert error.value.permanent
+    assert not any(
+        message.get("method") in {"thread/goal/set", "thread/read", "turn/start", "turn/steer"}
+        for message in transport.sent
+    )
+
+
+@run_async
+async def test_legacy_unnamed_profile_requires_explicit_recovery(tmp_path: Path) -> None:
+    event = notification(tmp_path)
+    legacy_context = WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=None,
+        approval_policy=APPROVAL_POLICY,
+        captured_at=NOW,
+    )
+    transport = ScriptedTransport(app_server_handler(status="idle", turns=[]))
+
+    with pytest.raises(AppServerProtocolError, match="legacy wake context") as error:
+        await deliver_notification(
+            replace(event, wake_context=legacy_context),
+            transport,
+            request_timeout=0.2,
+        )
+
+    assert error.value.permanent
+    assert transport.closed
+    assert not transport.sent
 
 
 @run_async
@@ -530,7 +726,7 @@ async def test_unix_websocket_transport_integrates_with_fake_server(tmp_path: Pa
 @run_async
 async def test_deliver_rejects_missing_thread_and_nonpending_event(tmp_path: Path) -> None:
     event = notification(tmp_path)
-    missing_thread = replace(event, originating_thread_id=None)
+    missing_thread = replace(event, originating_thread_id=None, wake_context=None)
     missing_transport = ScriptedTransport(lambda _message: [])
     with pytest.raises(AppServerProtocolError, match="no originating") as error:
         await deliver_notification(missing_thread, missing_transport)
@@ -557,7 +753,16 @@ def malformed_response_handler(fault: str) -> Callable[[dict[str, Any]], list[di
         if method == "thread/resume":
             if fault == "resume-missing":
                 return [{"id": request_id, "result": {}}]
-            return [{"id": request_id, "result": {"thread": thread("idle", [])}}]
+            return [
+                {
+                    "id": request_id,
+                    "result": {
+                        "thread": thread("idle", []),
+                        "activePermissionProfile": {"id": PERMISSION_PROFILE},
+                        "approvalPolicy": APPROVAL_POLICY,
+                    },
+                }
+            ]
         if method == "thread/read":
             response_thread: dict[str, Any] = thread("idle", [])
             if fault == "wrong-thread":
@@ -611,9 +816,10 @@ async def test_deliver_rejects_malformed_lifecycle_responses(
 async def test_deliver_rejects_unexpected_steer_turn_id(tmp_path: Path) -> None:
     event = notification(tmp_path)
     turns = [{"id": "active-turn", "status": "inProgress"}]
+    base_handler = app_server_handler(status="active", turns=turns)
 
     def handle(message: dict[str, Any]) -> list[dict[str, Any]]:
-        responses = app_server_handler(status="active", turns=turns)(message)
+        responses = base_handler(message)
         if message.get("method") == "turn/steer":
             return [{"id": message["id"], "result": {"turnId": "other-turn"}}]
         return responses

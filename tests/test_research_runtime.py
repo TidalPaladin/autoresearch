@@ -15,10 +15,12 @@ from project.research.runtime import (
     StateValidationError,
     StudyConfig,
     ensure_notification,
+    persist_wake_context,
     read_notification_event,
     read_terminal_event,
     record_terminal_event,
 )
+from project.research.wake_context import WakeContext
 
 EVENT_ID = "12345678-1234-5678-9234-567812345678"
 THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
@@ -83,6 +85,34 @@ def test_record_is_idempotent_by_event_id_and_uses_environment_thread(
     assert first[0].originating_thread_id == THREAD_ID
     assert UUID(first[0].event_id).version == 4 or first[0].event_id == EVENT_ID
     assert not (study.run_dir("pretrain-baseline-seed0") / "attempts").exists()
+
+
+def test_persisted_wake_context_is_loaded_and_cannot_be_replaced(study: StudyConfig) -> None:
+    context = WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=":danger-full-access",
+        approval_policy="never",
+        captured_at=OCCURRED_AT,
+    )
+    persist_wake_context(study, "pretrain-baseline-seed0", context)
+
+    _, notification = record_terminal_event(
+        study,
+        "pretrain-baseline-seed0",
+        attempt=1,
+        status="completed",
+        event_id=EVENT_ID,
+        occurred_at=OCCURRED_AT,
+        originating_thread_id=THREAD_ID,
+    )
+
+    assert notification.wake_context == context
+    with pytest.raises(StateValidationError, match="different immutable wake context"):
+        persist_wake_context(
+            study,
+            "pretrain-baseline-seed0",
+            replace(context, permission_profile=":workspace"),
+        )
 
 
 def test_record_archives_prior_pair_before_replacement(study: StudyConfig) -> None:

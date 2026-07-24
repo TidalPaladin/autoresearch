@@ -20,8 +20,10 @@ The repository requires Python 3.12 or later and `uv==0.11.28`. Direct dependenc
 Training and Codex communication are separate processes:
 
 ```text
+launch adapter
+  -> captures the live Codex permission profile and approval policy
+  -> registers the exact managed root and writes immutable wake-context.json
 project worker
-  -> registers the exact managed root
   -> writes terminal.json
   -> writes notification.json with state pending
   -> notification worker reads the event
@@ -57,6 +59,7 @@ logs/research/
     runs/
       <run-id>/
         .state.lock
+        wake-context.json
         terminal.json
         notification.json
         attempts/
@@ -67,7 +70,7 @@ logs/research/
 
 `.autoresearch-root.json` contains an exact schema version, marker kind, and canonical absolute root path. `record_terminal_event` creates it through an atomic same-directory replacement before producing queue state. An existing root without this marker is never scanned. Registration rejects files, filesystem and top-level roots, home directories and their parents, repository roots, broad working-directory parents, symlinked paths, and malformed or mismatched markers.
 
-The current terminal and notification pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records.
+The current terminal and notification pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records. `wake-context.json` is written once before dispatch and cannot be replaced with a different profile, approval policy, thread, or capture time.
 
 ### Register an existing root
 
@@ -80,6 +83,42 @@ uv run python scripts/research.py register-root --root logs/research
 The command is idempotent and does not scan or replace existing queue contents. A nonexistent worker root remains an empty successful sweep, but an existing unregistered root returns validation exit code `1`. Inspect registration as JSON with `--format json`; the document contains `created`, `root`, and `marker`.
 
 Runtime state under `logs/research/` is ignored by Git. Do not commit generated terminal files, notification files, locks, accepted-event ledgers, logs, credentials, or app-server schemas.
+
+## Capture wake context before dispatch
+
+The launch adapter must capture the effective context while the originating
+Codex turn is live, then persist it before spawning the supervisor:
+
+```python
+import os
+
+from project.research.codex_notifications import (
+    UnixWebSocketTransport,
+    capture_wake_context,
+)
+from project.research.runtime import persist_wake_context
+
+
+async def persist_launch_wake_context(study, run_id, socket_path):
+    transport = await UnixWebSocketTransport.connect(socket_path)
+    wake_context = await capture_wake_context(
+        thread_id=os.environ["CODEX_THREAD_ID"],
+        requested_permission_profile=os.environ.get("CODEX_PERMISSION_PROFILE"),
+        transport=transport,
+    )
+    persist_wake_context(study, run_id, wake_context)
+    # Spawn the detached supervisor only after persistence succeeds.
+```
+
+The notifier passes the recorded profile and approval policy to
+`thread/resume`, verifies the returned effective values, and applies the same
+values to `turn/start`. When `CODEX_PERMISSION_PROFILE` is unset, capture omits
+the override and persists the non-null profile ID resolved by app-server,
+including an implicit built-in ID. A missing or null effective profile fails
+before dispatch. Verification happens before a blocked goal can be reactivated.
+A legacy null-profile context requires explicit recovery, and a missing field or
+any mismatch fails delivery permanently. The worker never maps a legacy context
+to the current default or chooses a broader profile.
 
 ## Record terminal state from project code
 
@@ -105,7 +144,7 @@ terminal, notification = record_terminal_event(
 )
 ```
 
-The originating task defaults to `CODEX_THREAD_ID`. Pass `originating_thread_id=` when the host exposes the ID through another trusted source. A missing task ID produces durable terminal state, but the notification worker marks delivery failed because it has no safe destination.
+The originating task defaults to `CODEX_THREAD_ID`. Pass `originating_thread_id=` when the host exposes the ID through another trusted source. `record_terminal_event` loads the previously persisted wake context. A missing task ID or wake context produces durable terminal state, but the notification worker marks delivery failed because it has no safe destination or permission context.
 
 If the process stops after `terminal.json` is synced but before `notification.json` is queued, reconstruct the pending event with:
 
@@ -225,6 +264,14 @@ only a `blocked` goal. Explicit `paused`, `complete`, `usageLimited`, and
 `budgetLimited` states are preserved, and a task without a goal is still
 deliverable.
 
+After an adapter dispatches a round, it should verify supervisor identities and
+durable startup state, then return the originating goal to its event-wait state
+immediately when the goal API and higher-priority policy permit it. Apply the
+same transition after a nonterminal lifecycle event when no immediate mutation
+remains. The next accepted event reactivates a blocked goal. This avoids
+back-to-back automatic continuations whose only result is that training remains
+active.
+
 The wake message contains only validated identifiers, terminal status, and the absolute `terminal.json` path:
 
 ```text
@@ -284,6 +331,29 @@ and change from the prior report. Do not create a separate scheduled task, wake,
 wait, or polling loop for usage alone. The sample does not count as a research
 monitoring check.
 
+Token-use limits apply only to intervals spent polling or inspecting live
+experiment state. Exclude initial setup, implementation, tests, benchmarks,
+preflight, launch preparation and execution, result analysis, summaries, Git
+work, and any code or configuration changes required during a study. Capture
+token totals at the start and end of each monitoring interval when available.
+If an interval cannot be isolated, report it as unmeasured instead of using the
+aggregate goal or task total. Only the monitoring-only counter can trigger an
+excess-use stop or block.
+
+Primary-repository Git work has standing authorization for non-destructive
+study branches, commits, fetches, and pushes to non-protected branches. Tandem
+repositories may be branched and committed locally without another permission
+request; a clean exact-SHA local commit is sufficient provenance, but its push
+requires explicit permission. Pull requests, protected-branch pushes, history
+rewrites, tags, and destructive operations remain separately controlled.
+
+W&B online operations have standing authorization for declared non-sensitive
+research metrics, configs, and provenance. Scientific studies should track
+online. Keep exact destinations and per-operation manifests as provenance and
+data-boundary checks, and fail preflight instead of silently launching offline
+when they are incomplete. Reserve offline mode for explicit fallback tests or
+recorded tracker outages.
+
 When an authorized pull request includes terminal comparative results, refresh
 its body after pushing the result commit. Add a `## Findings` table generated
 from the committed structured summary with every evaluated variant or
@@ -309,7 +379,8 @@ changes and studies that are still active.
 
 The generic package does not implement training, external trackers, process supervision, or monitoring schedules. A downstream adapter must implement these protocol rules:
 
-- Declare an emitted-data-class manifest for each tracker operation, including launch, summary, backfill, configuration, and provenance. An online write requires the exact destination and approval for every emitted class. Otherwise the complete operation remains local, and provenance records the requested and effective modes.
+- Declare an emitted-data-class manifest for each W&B operation, including launch, summary, backfill, configuration, and provenance. Use the standing online authorization only with an exact destination and declared non-sensitive classes; reject incomplete scientific-study declarations instead of silently falling back to local-only mode, and record requested and effective modes.
+- Require the primary repository to be clean and pushed at its recorded SHA. Permit clean unpushed tandem repositories when their local commit, dependency pin, and frozen imported source match that SHA exactly.
 - Own the child process group after spawn. On heartbeat or state-write failure, cancellation, interrupt, or another exceptional exit, terminate the group, escalate when required, and reap every child before releasing GPU or other resource locks.
 - Change a run's polling counter and `next_check_at` only when that run is due. A wake for a terminal run clears only that run's poll and leaves every unrelated run's counters and schedule unchanged.
 - Use registered managed roots and `append_research_log` semantics for notification state and the shared study log.

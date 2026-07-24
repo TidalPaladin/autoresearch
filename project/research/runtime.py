@@ -20,6 +20,12 @@ from uuid import UUID, uuid4
 import yaml
 from filelock import FileLock
 
+from project.research.wake_context import (
+    WAKE_CONTEXT_FILENAME,
+    WakeContext,
+    WakeContextValidationError,
+)
+
 SCHEMA_VERSION = 1
 STATE_LOCK_NAME = ".state.lock"
 TERMINAL_FILE_NAME = "terminal.json"
@@ -400,6 +406,7 @@ class NotificationEvent:
     accepted_at: datetime | None
     accepted_rpc_method: str | None
     accepted_turn_id: str | None
+    wake_context: WakeContext | None = None
 
     def __post_init__(self) -> None:
         terminal = self.as_terminal()
@@ -466,6 +473,11 @@ class NotificationEvent:
                 raise StateValidationError(
                     "retried pending notification has incomplete retry metadata"
                 )
+        if (
+            self.wake_context is not None
+            and self.wake_context.thread_id != self.originating_thread_id
+        ):
+            raise StateValidationError("wake context thread does not match the originating thread")
         del terminal
 
     def as_terminal(self) -> TerminalEvent:
@@ -482,7 +494,12 @@ class NotificationEvent:
         )
 
     @classmethod
-    def from_terminal(cls, terminal: TerminalEvent) -> NotificationEvent:
+    def from_terminal(
+        cls,
+        terminal: TerminalEvent,
+        *,
+        wake_context: WakeContext | None = None,
+    ) -> NotificationEvent:
         return cls(
             schema_version=terminal.schema_version,
             event_id=terminal.event_id,
@@ -501,6 +518,7 @@ class NotificationEvent:
             accepted_at=None,
             accepted_rpc_method=None,
             accepted_turn_id=None,
+            wake_context=wake_context,
         )
 
     @classmethod
@@ -679,6 +697,25 @@ def validate_managed_root(root: Path) -> Path:
     return resolved
 
 
+def _read_wake_context(run_dir: Path, managed_root: Path) -> WakeContext | None:
+    resolved_run_dir = _resolved_managed_path(
+        run_dir.absolute(),
+        managed_root,
+        "managed run directory",
+    )
+    context_path = resolved_run_dir / WAKE_CONTEXT_FILENAME
+    if context_path.is_symlink():
+        raise StateValidationError("wake context must not be a symlink")
+    if not context_path.exists():
+        return None
+    if not context_path.is_file():
+        raise StateValidationError("wake context must be a file")
+    try:
+        return WakeContext.from_dict(_load_json(context_path))
+    except WakeContextValidationError as error:
+        raise StateValidationError(f"wake context in {context_path} is invalid: {error}") from error
+
+
 def register_managed_root(root: Path) -> ManagedRootRegistration:
     """Atomically register one safe root without scanning or replacing its contents."""
 
@@ -700,6 +737,30 @@ def register_managed_root(root: Path) -> ManagedRootRegistration:
         },
     )
     return ManagedRootRegistration(root=resolved, marker=marker, created=True)
+
+
+def persist_wake_context(
+    study: StudyConfig,
+    run_id: str,
+    context: WakeContext,
+) -> Path:
+    """Persist one immutable permission context before dispatching a managed run."""
+    if context.permission_profile is None:
+        raise StateValidationError("new wake context must include a selectable permission profile")
+    register_managed_root(study.log_root)
+    run_dir = study.run_dir(run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    context_path = run_dir / WAKE_CONTEXT_FILENAME
+    with FileLock(str(run_dir / STATE_LOCK_NAME)):
+        current = _read_wake_context(run_dir, study.log_root)
+        if current is not None:
+            if current != context:
+                raise StateValidationError(
+                    "managed run already has a different immutable wake context"
+                )
+            return context_path
+        _atomic_write_json(context_path, context.to_dict())
+    return context_path
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -917,8 +978,15 @@ def read_notification_event(
     """Read and validate a queued notification and optional matching terminal event."""
 
     resolved_path = _resolved_managed_path(path.absolute(), managed_root, "notification file path")
-    return NotificationEvent.from_dict(
+    event = NotificationEvent.from_dict(
         _load_json(resolved_path), resolved_path, managed_root, terminal=terminal
+    )
+    return replace(
+        event,
+        wake_context=_read_wake_context(
+            Path(event.terminal_state_path).parent,
+            managed_root,
+        ),
     )
 
 
@@ -937,7 +1005,10 @@ def _archive_current_pair(run_dir: Path, managed_root: Path, terminal: TerminalE
     if notification_path.exists():
         notification = read_notification_event(notification_path, managed_root, terminal=terminal)
     else:
-        notification = NotificationEvent.from_terminal(terminal)
+        notification = NotificationEvent.from_terminal(
+            terminal,
+            wake_context=_read_wake_context(run_dir, managed_root),
+        )
     archive_dir = run_dir / "attempts" / f"{terminal.attempt}-{terminal.event_id}"
     _resolved_managed_path(archive_dir.absolute(), managed_root, "archive path")
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1013,12 +1084,18 @@ def record_terminal_event(
                         notification_path, study.log_root, terminal=current
                     )
                 else:
-                    notification = NotificationEvent.from_terminal(current)
+                    notification = NotificationEvent.from_terminal(
+                        current,
+                        wake_context=_read_wake_context(run_dir, study.log_root),
+                    )
                     _atomic_write_json(notification_path, notification.to_dict())
                 return current, notification
             _archive_current_pair(run_dir, study.log_root, current)
 
-        notification = NotificationEvent.from_terminal(terminal)
+        notification = NotificationEvent.from_terminal(
+            terminal,
+            wake_context=_read_wake_context(run_dir, study.log_root),
+        )
         _atomic_write_json(terminal_path, terminal.to_dict())
         _atomic_write_json(run_dir / NOTIFICATION_FILE_NAME, notification.to_dict())
         return terminal, notification
@@ -1047,7 +1124,10 @@ def ensure_notification(
                 notification_path, study.log_root, terminal=terminal
             )
         else:
-            notification = NotificationEvent.from_terminal(terminal)
+            notification = NotificationEvent.from_terminal(
+                terminal,
+                wake_context=_read_wake_context(run_dir, study.log_root),
+            )
             _atomic_write_json(notification_path, notification.to_dict())
         if requeue:
             notification = notification.requeued()

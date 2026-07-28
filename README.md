@@ -15,6 +15,51 @@ The package remains named `project` and the distribution remains named `python-t
 
 The repository requires Python 3.12 or later and `uv==0.11.28`. Direct dependencies and build tools are pinned in `pyproject.toml`; `uv.lock` makes the full environment reproducible.
 
+## Continuous integration
+
+GitHub Actions is the CI provider. [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+runs for pull requests to `master`, pushes to `master`, and manual dispatches on
+GitHub-hosted `ubuntu-24.04` runners. It grants only `contents: read` and exposes
+one stable branch-protection check named `Required`. That check succeeds only
+when all of these jobs succeed:
+
+- `Quality`: actionlint, offline pedantic zizmor, formatting, Ruff, and Basedpyright.
+- `Tests / Python 3.12` and `Tests / Python 3.14`: the full suite on both supported
+  minors, with 90 percent branch coverage enforced on Python 3.14.
+- `Notify loop`: focused end-to-end notification delivery and outage behavior.
+- `Package`: exactly one wheel and source distribution plus an isolated import.
+
+The notification-loop job is subscription-free. It starts a temporary
+WebSocket-over-Unix fake app-server and runs the real `notify-worker` CLI through
+an absolute Python executable. The test removes Codex, ChatGPT, and OpenAI
+environment variables, gives the subprocess a `PATH` with no `codex` executable,
+and uses no daemon, API key, network service, or Codex subscription. It verifies
+the fixed wake prompt and durable state without waking a real task.
+
+Two rollout workflows are manual-only until their exact revisions can be
+dispatched from a workflow already present on `master`:
+
+- `production-package.yml` uploads the wheel, source distribution, and verified
+  `SHA256SUMS` as `production-package` for 7 days. Its planned schedule is
+  `17 3 * * 1` (Mondays at 03:17 UTC).
+- `dependency-health.yml` uploads PyPI and OSV audit evidence as
+  `security-audit-evidence` and direct-pin, Python-support, and warning evidence
+  as `deprecation-report`, both for 7 days. Its planned schedule is
+  `23 4 * * 2` (Tuesdays at 04:23 UTC). Security findings and incomplete scans
+  both fail; per-service metadata distinguishes them. Deprecation findings are
+  informational, while network, schema, parsing, and execution failures fail.
+  There are no advisory exceptions. A future exception must name the advisory,
+  supporting evidence, owner, and expiry or review date.
+
+After `Required` first succeeds on `master`, maintainers can add the schedules
+in a second reviewed change and enable the `Require CI on master` ruleset for
+the exact `Required` context with up-to-date branches required. Each scheduled
+workflow revision must first pass an exact-ref manual dispatch and preserve the
+run, head SHA, workflow blob, expected jobs, and artifact or smoke evidence.
+There is no trusted GitHub callback or exact-run local watcher in this
+repository, so automatic Codex wake-up for those dispatches is unavailable;
+resume the originating task manually to collect authoritative run evidence.
+
 ## Notification architecture
 
 Training and Codex communication are separate processes:
@@ -393,13 +438,15 @@ The generic package does not implement training, external trackers, process supe
 ## Development commands
 
 ```bash
-make format         # rewrite Python formatting
-make lint           # Ruff lint checks
-make types          # Basedpyright
-make test           # pytest with branch coverage, minimum 90 percent
-make audit          # pip-audit across all locked groups
-make check          # all non-rewriting gates
-make package-check  # build and import the wheel in an isolated environment
+make format            # rewrite Python formatting
+make lint              # Ruff lint checks
+make types             # Basedpyright
+make test              # full suite with branch coverage, minimum 90 percent
+make test-compat       # full suite without coverage for compatibility legs
+make test-notify-loop  # focused fake-server sleep/wake/notify integration tests
+make audit             # hash-checked pip-audit across all locked groups
+make check             # all non-rewriting gates
+make package-check     # build one wheel and sdist, then import the wheel
 ```
 
 ## Canonical autoresearch skill

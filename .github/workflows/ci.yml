@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: quality-py3.14
+          prune-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Verify base tools and versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v bash
+          command -v curl
+          command -v sha256sum
+          command -v tar
+          python --version
+          uv --version
+          test "$(uv --version)" = "uv 0.11.28"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Install workflow validators
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="${RUNNER_TEMP}/ci-tools"
+          actionlint_archive="${tools_dir}/actionlint.tar.gz"
+          zizmor_archive="${tools_dir}/zizmor.tar.gz"
+          mkdir -p "${tools_dir}/actionlint" "${tools_dir}/zizmor"
+          curl --fail --location --silent --show-error \
+            --output "${actionlint_archive}" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${actionlint_archive}" \
+            | sha256sum --check -
+          tar -xzf "${actionlint_archive}" -C "${tools_dir}/actionlint"
+          curl --fail --location --silent --show-error \
+            --output "${zizmor_archive}" \
+            https://github.com/zizmorcore/zizmor/releases/download/v1.28.0/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          echo "e87b67160194884e375a46a12c57ccc904f762b53845f254fab7f17d98809c09  ${zizmor_archive}" \
+            | sha256sum --check -
+          tar -xzf "${zizmor_archive}" -C "${tools_dir}/zizmor"
+          IFS= read -r actionlint_version < <("${tools_dir}/actionlint/actionlint" --version)
+          test "${actionlint_version}" = "1.7.12"
+          test "$("${tools_dir}/zizmor/zizmor" --version)" = "zizmor 1.28.0"
+          echo "${tools_dir}/actionlint" >> "${GITHUB_PATH}"
+          echo "${tools_dir}/zizmor" >> "${GITHUB_PATH}"
+      - name: Validate workflows
+        run: |
+          actionlint
+          zizmor --pedantic --strict-collection --offline .github
+      - name: Run formatting, lint, and type checks
+        run: make format-check lint types
+
+  tests:
+    name: Tests / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.12"
+          - "3.14"
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ matrix.python-version }}
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: tests-py${{ matrix.python-version }}
+          prune-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Verify tool versions
+        run: |
+          python --version
+          uv --version
+          test "$(uv --version)" = "uv 0.11.28"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Run Python 3.12 compatibility tests
+        if: ${{ matrix.python-version == '3.12' }}
+        run: make test-compat
+      - name: Run Python 3.14 tests with branch coverage
+        if: ${{ matrix.python-version == '3.14' }}
+        run: make test
+      - name: Upload Python 3.14 coverage
+        if: ${{ matrix.python-version == '3.14' }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-python-3.14
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 7
+
+  notify_loop:
+    name: Notify loop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: notify-loop-py3.14
+          prune-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Verify tool versions
+        run: |
+          python --version
+          uv --version
+          test "$(uv --version)" = "uv 0.11.28"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Run subscription-free notification-loop tests
+        run: make test-notify-loop
+
+  package:
+    name: Package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: package-py3.14
+          prune-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Verify tool versions
+        run: |
+          python --version
+          uv --version
+          test "$(uv --version)" = "uv 0.11.28"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Build and verify one wheel and source distribution
+        run: make package-check
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs:
+      - quality
+      - tests
+      - notify_loop
+      - package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          NOTIFY_LOOP_RESULT: ${{ needs.notify_loop.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${QUALITY_RESULT}" = "success"
+          test "${TESTS_RESULT}" = "success"
+          test "${NOTIFY_LOOP_RESULT}" = "success"
+          test "${PACKAGE_RESULT}" = "success"

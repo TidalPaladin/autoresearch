@@ -1,0 +1,213 @@
+name: Dependency health
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  security_audit:
+    name: security-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: dependency-security-py3.14
+          prune-cache: true
+          restore-cache: true
+          save-cache: true
+      - name: Verify base tools and versions
+        run: |
+          command -v curl
+          command -v sha256sum
+          command -v tar
+          python --version
+          uv --version
+          test "$(uv --version)" = "uv 0.11.28"
+      - name: Install locked dependencies
+        run: |
+          uv sync --frozen --all-groups
+          test "$(uv run --frozen pip-audit --version)" = "pip-audit 2.10.1"
+      - name: Export every locked dependency group with hashes
+        run: |
+          mkdir -p reports/security
+          uv export --quiet --frozen --all-groups --no-emit-project \
+            --format requirements-txt \
+            --output-file reports/security/locked-requirements.txt
+      - name: Audit against PyPI advisories
+        id: pypi_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "null" > reports/security/pypi-audit.json
+          set +e
+          uv run --frozen pip-audit \
+            --disable-pip \
+            --strict \
+            --require-hashes \
+            --progress-spinner off \
+            --vulnerability-service pypi \
+            --format json \
+            --output reports/security/pypi-audit.json \
+            --requirement reports/security/locked-requirements.txt
+          scanner_exit_code=$?
+          set -e
+          uv run --frozen python scripts/classify_audit.py \
+            --service pypi \
+            --report reports/security/pypi-audit.json \
+            --metadata reports/security/pypi-metadata.json \
+            --scanner-exit-code "${scanner_exit_code}" \
+            --requirements reports/security/locked-requirements.txt \
+            --lockfile uv.lock \
+            --command "uv run --frozen pip-audit --disable-pip --strict --require-hashes --progress-spinner off --vulnerability-service pypi --format json --output reports/security/pypi-audit.json --requirement reports/security/locked-requirements.txt"
+      - name: Audit against OSV advisories
+        id: osv_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "null" > reports/security/osv-audit.json
+          set +e
+          uv run --frozen pip-audit \
+            --disable-pip \
+            --strict \
+            --require-hashes \
+            --progress-spinner off \
+            --vulnerability-service osv \
+            --format json \
+            --output reports/security/osv-audit.json \
+            --requirement reports/security/locked-requirements.txt
+          scanner_exit_code=$?
+          set -e
+          uv run --frozen python scripts/classify_audit.py \
+            --service osv \
+            --report reports/security/osv-audit.json \
+            --metadata reports/security/osv-metadata.json \
+            --scanner-exit-code "${scanner_exit_code}" \
+            --requirements reports/security/locked-requirements.txt \
+            --lockfile uv.lock \
+            --command "uv run --frozen pip-audit --disable-pip --strict --require-hashes --progress-spinner off --vulnerability-service osv --format json --output reports/security/osv-audit.json --requirement reports/security/locked-requirements.txt"
+      - name: Install zizmor
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="${RUNNER_TEMP}/ci-tools"
+          zizmor_archive="${tools_dir}/zizmor.tar.gz"
+          mkdir -p "${tools_dir}/zizmor"
+          curl --fail --location --silent --show-error \
+            --output "${zizmor_archive}" \
+            https://github.com/zizmorcore/zizmor/releases/download/v1.28.0/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          echo "e87b67160194884e375a46a12c57ccc904f762b53845f254fab7f17d98809c09  ${zizmor_archive}" \
+            | sha256sum --check -
+          tar -xzf "${zizmor_archive}" -C "${tools_dir}/zizmor"
+          test "$("${tools_dir}/zizmor/zizmor" --version)" = "zizmor 1.28.0"
+          echo "${tools_dir}/zizmor" >> "${GITHUB_PATH}"
+      - name: Audit workflows with zizmor
+        id: zizmor_audit
+        continue-on-error: true
+        run: >-
+          zizmor --pedantic --strict-collection --offline --format json
+          .github > reports/security/zizmor.json
+      - name: Upload security audit evidence
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: security-audit-evidence
+          path: reports/security
+          if-no-files-found: error
+          retention-days: 7
+      - name: Fail for findings or incomplete scans
+        if: ${{ always() }}
+        env:
+          OSV_OUTCOME: ${{ steps.osv_audit.outcome }}
+          PYPI_OUTCOME: ${{ steps.pypi_audit.outcome }}
+          ZIZMOR_OUTCOME: ${{ steps.zizmor_audit.outcome }}
+        run: |
+          test "${PYPI_OUTCOME}" = "success"
+          test "${OSV_OUTCOME}" = "success"
+          test "${ZIZMOR_OUTCOME}" = "success"
+
+  deprecation_report:
+    name: deprecation-report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: dependency-deprecation-py3.14
+          prune-cache: true
+          restore-cache: true
+          save-cache: true
+      - name: Verify tool versions
+        run: |
+          python --version
+          uv --version
+          test "$(uv --version)" = "uv 0.11.28"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Run tests with deprecation warnings visible
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/deprecation
+          uv run --frozen pytest \
+            -W default::DeprecationWarning \
+            -W default::PendingDeprecationWarning \
+            tests 2>&1 | tee reports/deprecation/deprecation-warnings.txt
+      - name: Inspect direct pins and supported Python versions
+        run: |
+          uv run --frozen python scripts/deprecation_report.py \
+            --warnings-file reports/deprecation/deprecation-warnings.txt \
+            --output reports/deprecation/deprecation-report.json \
+            --summary "${GITHUB_STEP_SUMMARY}"
+      - name: Upload deprecation evidence
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: deprecation-report
+          path: reports/deprecation
+          if-no-files-found: error
+          retention-days: 7

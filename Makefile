@@ -1,4 +1,4 @@
-.PHONY: audit check clean clean-env format format-check init lint package-check test test-% types update
+.PHONY: audit check clean clean-env format format-check init lint package-check test test-% test-compat test-notify-loop types update
 
 SOURCES = project scripts tests
 UV = uv
@@ -22,23 +22,32 @@ test: ## run tests with branch coverage and the 90 percent threshold
 		--cov-report=xml \
 		tests
 
+test-compat: ## run the full suite without collecting coverage
+	$(UV) run --frozen pytest tests
+
+test-notify-loop: ## run the subscription-free notification-loop integration tests
+	$(UV) run --frozen pytest tests/test_notify_loop.py
+
 test-%: ## run tests matching a pattern
 	$(UV) run --frozen pytest -k $* tests
 
 audit: ## scan all locked dependency groups for known advisories
 	audit_requirements="$$(mktemp)"; \
 		trap 'rm -f "$$audit_requirements"' EXIT; \
-		$(UV) export --quiet --frozen --all-groups --no-hashes --no-emit-project \
+		$(UV) export --quiet --frozen --all-groups --no-emit-project \
 			--format requirements-txt --output-file "$$audit_requirements"; \
-		$(UV) run --frozen pip-audit --disable-pip --no-deps \
+		$(UV) run --frozen pip-audit --disable-pip --strict --require-hashes \
 			--progress-spinner off -r "$$audit_requirements"
 
 check: format-check lint types test audit ## run all non-rewriting quality gates
 
 package-check: ## build a wheel and import it in an isolated environment
-	$(UV) build --no-sources
-	wheel="$$(find dist -name '*.whl' -print -quit)"; \
-		test -n "$$wheel"; \
+	$(UV) build --no-sources --clear
+	wheel_count="$$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"; \
+		sdist_count="$$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"; \
+		test "$$wheel_count" -eq 1; \
+		test "$$sdist_count" -eq 1; \
+		wheel="$$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"; \
 		$(UV) run --isolated --no-project --with "$$wheel" python -c "import project"
 
 init: ## install all locked dependency groups

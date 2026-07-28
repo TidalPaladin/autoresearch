@@ -19,9 +19,11 @@ This repository is a reusable Python autoresearch template. Keep the generic `pr
 - Lint: `make lint`
 - Type check: `make types`
 - Test with coverage: `make test`
+- Test compatibility without coverage: `make test-compat`
+- Test the subscription-free notification loop: `make test-notify-loop`
 - Audit locked dependencies: `make audit`
 - Run all non-rewriting gates: `make check`
-- Verify the built wheel: `make package-check`
+- Verify one wheel and source distribution: `make package-check`
 - Validate the project skill: `uv run python "${CODEX_HOME:-${HOME}/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" .agents/skills/autoresearch`
 
 Use `uv==0.11.28`. Pin direct dependencies and commit `uv.lock`. Preserve Hatch VCS versioning. Do not add a static project version or create release tags as part of ordinary maintenance.
@@ -33,6 +35,17 @@ Use `uv==0.11.28`. Pin direct dependencies and commit `uv.lock`. Preserve Hatch 
 - Test state corruption, path escapes, crash windows, retries, protocol races, and I/O failures, not only successful delivery.
 - Use fake WebSocket-over-Unix servers. Tests must not connect to or wake a real Codex task.
 - Run tests on Python 3.12 and 3.14 for changes to the runtime or notifier.
+
+## Continuous integration
+
+- Use GitHub Actions on `ubuntu-24.04`; do not restore CircleCI or Codecov configuration.
+- Keep `Required` as the single stable required context. It must fail when Quality, either Python test leg, Notify loop, or Package fails, is cancelled, or is skipped.
+- Keep CI free of repository secrets and Codex subscriptions. The focused notification test must use an explicit temporary fake Unix socket, an absolute Python executable, no `codex` executable on `PATH`, and no Codex, ChatGPT, or OpenAI environment variables.
+- Keep `production-package.yml` and `dependency-health.yml` manual-only until each workflow exists on `master` and passes exact-ref dispatch validation. Then add `17 3 * * 1` and `23 4 * * 2`, respectively, in a separate reviewed change.
+- Retain production packages, checksums, security audit evidence, and deprecation evidence for 7 days. Security findings and incomplete scans both fail; deprecation findings remain informational.
+- Do not add advisory exceptions by default. Every future exception must name the advisory, evidence, owner, and expiry or review date.
+- Enable the `Require CI on master` ruleset only after the matching-head `Required` check succeeds on `master`. Require that context and an up-to-date branch, with no review-count rule or bypass actor.
+- No trusted callback or exact-run non-model watcher is configured for GitHub Actions. Do not claim automatic Codex wake delivery; resume the task manually and validate the exact run, attempt, ref, head SHA, workflow blob, jobs, and artifacts.
 
 ## State safety
 

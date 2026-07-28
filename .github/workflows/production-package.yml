@@ -45,7 +45,7 @@ jobs:
           command -v sha256sum
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Build and smoke-test the package

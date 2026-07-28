@@ -56,7 +56,7 @@ jobs:
           command -v tar
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Install workflow validators
@@ -130,7 +130,7 @@ jobs:
         run: |
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Run Python 3.12 compatibility tests
@@ -182,7 +182,7 @@ jobs:
         run: |
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Run subscription-free notification-loop tests
@@ -221,7 +221,7 @@ jobs:
         run: |
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Build and verify one wheel and source distribution

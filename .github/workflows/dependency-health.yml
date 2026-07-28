@@ -47,7 +47,7 @@ jobs:
           command -v tar
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: |
           uv sync --frozen --all-groups
@@ -184,7 +184,7 @@ jobs:
         run: |
           python --version
           uv --version
-          test "$(uv --version)" = "uv 0.11.28"
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       - name: Run tests with deprecation warnings visible

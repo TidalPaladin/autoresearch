@@ -22,6 +22,7 @@ from project.research.codex_notifications import (
     build_wake_prompt,
     capture_wake_context,
     deliver_notification,
+    next_notification_attempt_at,
     notification_lock_path,
     sweep_notifications,
     unix_connector,
@@ -657,6 +658,23 @@ async def test_sweep_schedules_one_full_jitter_retry_per_run(tmp_path: Path) -> 
         ).attempt_count
         == 1
     )
+
+
+def test_next_notification_attempt_at_returns_earliest_durable_retry(tmp_path: Path) -> None:
+    event = notification(tmp_path)
+    retry_at = NOW + timedelta(seconds=5)
+    write_notification_event(
+        event.with_delivery_failure(
+            attempted_at=NOW,
+            error="temporary socket failure",
+            next_attempt_at=retry_at,
+            exhausted=False,
+        ),
+        tmp_path / "logs",
+    )
+
+    assert next_notification_attempt_at(tmp_path / "logs") == retry_at
+    assert next_notification_attempt_at(tmp_path / "missing") is None
 
 
 @run_async

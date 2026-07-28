@@ -300,9 +300,13 @@ train-validation-checkpoint cycle, supervisor loss without terminal state, and
 trainer-progress stalls. Drive their controller from durable file events,
 process-exit handles, and explicit progress deadlines. Routine progress,
 heartbeats, notification retries, and acceptance writes must not wake Codex or
-retrigger delivery. After a transport failure, keep events queued and gate more
-automatic attempts until daemon socket replacement or a due sparse recovery
-check.
+retrigger delivery. After a transient transport failure, keep the event queued
+and add the earliest durable `next_attempt_at` to the controller's local selector
+or timer. Run one notification sweep at that deadline and recompute it from
+persisted state. This does not spend a model turn or poll the filesystem. A
+retrying event must not block a fresh due event, and socket replacement may
+trigger an immediate sweep. Persist controller startup, sweep outcomes, isolated
+problems, and shutdown or failure in a local log.
 
 When an event source is unavailable, a scheduled task can run the worker as a
 sparse fallback:
@@ -384,6 +388,7 @@ The generic package does not implement training, external trackers, process supe
 - Own the child process group after spawn. On heartbeat or state-write failure, cancellation, interrupt, or another exceptional exit, terminate the group, escalate when required, and reap every child before releasing GPU or other resource locks.
 - Change a run's polling counter and `next_check_at` only when that run is due. A wake for a terminal run clears only that run's poll and leaves every unrelated run's counters and schedule unchanged.
 - Use registered managed roots and `append_research_log` semantics for notification state and the shared study log.
+- Keep status, read-only monitoring, summary, and notification recovery usable without training-data mounts or launch-only environment variables. Validate those inputs at preflight or launch and name unresolved variables explicitly.
 
 ## Development commands
 

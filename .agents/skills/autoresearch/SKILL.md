@@ -284,10 +284,16 @@ progress, heartbeat, notification retry, and acceptance writes must not wake the
 model or recursively trigger delivery. Coalesce related events into one recovery
 turn when doing so preserves per-run state and ordering.
 
-If delivery fails, leave the event queued and gate further automatic attempts
-until an external readiness signal such as daemon socket replacement or a due
-sparse recovery check. Do not turn notification backoff into a model or
-filesystem polling loop.
+If delivery fails transiently, leave the event queued and let the same non-model
+controller include the earliest durable `next_attempt_at` in its selector or
+timer deadline. Run one sweep when that deadline becomes due, then recompute the
+deadline from persisted state. This local timer is not model or filesystem
+polling. A retrying event must not suppress fresh due events, even for the same
+study; never use one global transport-ready latch for the notification set.
+Socket replacement may trigger an immediate sweep. Notification retry and
+acceptance writes remain excluded as recursive file-event sources. Persist
+controller startup, sweep outcomes, isolated problems, and shutdown or failure
+locally so missed delivery can be diagnosed after the process exits.
 
 ## Monitoring cadence
 
@@ -441,6 +447,7 @@ Require an adapter to define:
 - current and planned epochs or another progress-counter contract;
 - polling bounds, due-only transitions, and timeout behavior;
 - managed study path classification and exact root registration;
+- launch-only training-data validation, explicit unresolved-environment errors, and dataset-independent read-only and notification recovery commands;
 - metric names and convergence calculations;
 - data split and leakage rules;
 - per-operation tracker destinations, emitted-data-class manifests, authorization gates, effective mode, and local fallback;
@@ -448,7 +455,7 @@ Require an adapter to define:
 - child process-group ownership, exceptional-exit termination, reaping, and resource-lock release order;
 - promotion and replication thresholds;
 - lifecycle milestones, trainer progress deadlines, and supervisor-loss detection;
-- non-model event-controller sources and retry-loop suppression;
+- non-model event-controller sources, exact retry-deadline scheduling, durable controller logs, and retry-loop suppression;
 - per-thread notification queue and active-turn handling;
 - immutable launch-time wake-context capture, exact permission resume, and fail-closed verification;
 - lifecycle, terminal-state, and notification delivery behavior.

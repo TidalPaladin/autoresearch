@@ -711,6 +711,24 @@ def _notification_paths(root: Path) -> list[Path]:
     )
 
 
+def next_notification_attempt_at(root: Path) -> datetime | None:
+    """Return the earliest scheduled retry under an exact managed root."""
+
+    requested_root = root.expanduser()
+    if not requested_root.exists() and not requested_root.is_symlink():
+        return None
+    managed_root = validate_managed_root(requested_root)
+    retry_deadlines: list[datetime] = []
+    for path in _notification_paths(managed_root):
+        try:
+            event = read_notification_event(path, managed_root)
+        except (OSError, StateValidationError):
+            continue
+        if event.state == "pending" and event.next_attempt_at is not None:
+            retry_deadlines.append(event.next_attempt_at)
+    return min(retry_deadlines) if retry_deadlines else None
+
+
 async def sweep_notifications(
     root: Path,
     *,

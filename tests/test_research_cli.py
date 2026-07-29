@@ -23,39 +23,21 @@ THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
 def test_daemon_socket_resolution_prefers_explicit_path(tmp_path: Path) -> None:
     socket_path = tmp_path / "daemon.sock"
 
-    resolved = resolve_daemon_socket(
-        socket_path,
-        daemon_version=lambda: (_ for _ in ()).throw(AssertionError("must not inspect daemon")),
-    )
+    resolved = resolve_daemon_socket(socket_path)
 
     assert resolved == socket_path.resolve()
 
 
-def test_daemon_socket_resolution_discovers_running_socket(tmp_path: Path) -> None:
+def test_daemon_socket_resolution_uses_shared_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     socket_path = tmp_path / "daemon.sock"
+    monkeypatch.setattr("scripts.research.discover_daemon_socket", lambda: socket_path)
 
-    resolved = resolve_daemon_socket(
-        None,
-        daemon_version=lambda: json.dumps({"status": "running", "socketPath": str(socket_path)}),
-    )
+    resolved = resolve_daemon_socket(None)
 
-    assert resolved == socket_path.resolve()
-
-
-@pytest.mark.parametrize(
-    ("payload", "message"),
-    [
-        ("not-json", "not valid JSON"),
-        (json.dumps({"status": "stopped"}), "absolute running socket"),
-        (
-            json.dumps({"status": "running", "socketPath": "relative.sock"}),
-            "absolute running socket",
-        ),
-    ],
-)
-def test_daemon_socket_resolution_rejects_invalid_daemon_state(payload: str, message: str) -> None:
-    with pytest.raises(RuntimeError, match=message):
-        resolve_daemon_socket(None, daemon_version=lambda: payload)
+    assert resolved == socket_path
 
 
 def run_cli(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -97,7 +79,7 @@ def test_notify_recovers_missing_notification_as_json(study_file: Path, tmp_path
     assert result.returncode == 0
     assert result.stderr == ""
     payload = json.loads(result.stdout)
-    assert payload["state"] == "pending"
+    assert payload["delivery"]["state"] == "pending"
     assert payload["run_id"] == "run-a"
 
 
@@ -163,7 +145,7 @@ def test_notify_validation_problem_uses_exit_one(study_file: Path, tmp_path: Pat
 
     assert result.returncode == 1
     assert result.stdout == ""
-    assert "terminal state" in result.stderr
+    assert "version-2 notification pointer" in result.stderr
 
 
 def test_invalid_invocation_uses_exit_two(tmp_path: Path) -> None:
@@ -209,7 +191,15 @@ def test_worker_rejects_removed_transport_flag(tmp_path: Path) -> None:
 
 def test_worker_delivery_problem_uses_exit_one_and_clean_json(tmp_path: Path) -> None:
     register_managed_root(tmp_path / "logs")
-    path = tmp_path / "logs" / "study-a" / "runs" / "run-a" / "notification.json"
+    path = (
+        tmp_path
+        / "logs"
+        / ".notify-wake"
+        / "v2"
+        / "events"
+        / "12345678-1234-5678-9234-567812345678"
+        / "notification.json"
+    )
     path.parent.mkdir(parents=True)
     path.write_text("not-json", encoding="utf-8")
 
@@ -261,7 +251,7 @@ def test_notify_requeues_failed_event(study_file: Path, tmp_path: Path) -> None:
     assert failed_result.returncode == 1
     assert failed_result.stdout.count("\n") == 1
     assert requeued_result.returncode == 0
-    assert json.loads(requeued_result.stdout)["state"] == "pending"
+    assert json.loads(requeued_result.stdout)["delivery"]["state"] == "pending"
     path = Path(event.terminal_state_path).with_name("notification.json")
     assert read_notification_event(path, study.log_root).attempt_count == 0
 

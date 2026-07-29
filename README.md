@@ -67,17 +67,26 @@ Training and Codex communication are separate processes:
 ```text
 launch adapter
   -> captures the live Codex permission profile and approval policy
-  -> registers the exact managed root and writes immutable wake-context.json
+  -> registers the exact managed root and writes v2 wake context
 project worker
-  -> writes terminal.json
-  -> writes notification.json with state pending
+  -> writes immutable v2 terminal truth
+  -> queues the shared v2 delivery record
   -> notification worker reads the event
-  -> app-server resumes or steers the originating Codex task
+  -> notify-wake-runtime resumes or steers the originating Codex task
 ```
 
-`project/research/runtime.py` performs local file operations only. It writes terminal state before notification state and never waits for Codex. `project/research/codex_notifications.py` owns queue delivery and app-server communication. `scripts/research.py` exposes acknowledgement and one-shot worker commands.
+`project/research/runtime.py` owns research event production and local state.
+`project/research/codex_notifications.py` supplies the trusted prompt, registered
+root, retry timing, and controller integration. The pinned
+`notify-wake-runtime==1.0.0` package owns app-server transport, context capture,
+delivery, reconciliation, shared delivery state, and the goal-wait lease.
+Its source is the canonical `$notify-wake` skill under
+`/home/tidal/skills/notify-wake`.
 
-A notification error cannot change a terminal status such as `completed`, `failed`, or `timed_out`. It changes only delivery metadata in `notification.json`. Notification discovery starts only after the worker validates the root's registration marker.
+A notification error cannot change a terminal status such as `completed`,
+`failed`, or `timed_out`. It changes only the shared delivery record.
+Notification discovery starts only after the worker validates the root's
+registration marker.
 
 ## Study and state layout
 
@@ -95,27 +104,45 @@ Current state uses this layout:
 ```text
 logs/research/
   .autoresearch-root.json
-  .notification-locks/
-    <sha256-thread-id>.lock
-    <sha256-thread-id>.accepted.json
+  .notify-wake/
+    v2/
+      .notify-wake-root.json
+      .thread-locks/
+        <sha256-thread-id>.lock
+      goal-waits/
+        <sha256-thread-id>.json
+      contexts/
+        <study-id>/
+          <run-id>/
+            wake-context.json
+      current/
+        <study-id>/
+          <run-id>.json
+      events/
+        <event-id>/
+          terminal.json
+          notification.json
   <study-id>/
     .research-log.md.lock
     research-log.md
     runs/
       <run-id>/
-        .state.lock
-        wake-context.json
-        terminal.json
-        notification.json
-        attempts/
-          <attempt>-<event-id>/
-            terminal.json
-            notification.json
+        <research artifacts>
 ```
 
 `.autoresearch-root.json` contains an exact schema version, marker kind, and canonical absolute root path. `record_terminal_event` creates it through an atomic same-directory replacement before producing queue state. An existing root without this marker is never scanned. Registration rejects files, filesystem and top-level roots, home directories and their parents, repository roots, broad working-directory parents, symlinked paths, and malformed or mismatched markers.
 
-The current terminal and notification pair always describes one event. Recording a different event archives the prior pair before replacement. Repeating the same event ID with the same terminal fields is idempotent. Identifiers cannot contain separators, whitespace, or traversal components. Persisted paths must be absolute, remain under the declared log root after symlink resolution, and match between the terminal and notification records. `wake-context.json` is written once before dispatch and cannot be replaced with a different profile, approval policy, thread, or capture time.
+Every event directory is immutable by event ID. A per-run pointer selects the
+current event without moving or rewriting prior events. Repeating the same event
+ID with the same terminal fields is idempotent. Identifiers cannot contain
+separators, whitespace, or traversal components. Persisted paths must be
+absolute, remain under the declared log root after symlink resolution, and
+match their v2 event identity. `wake-context.json` is written before dispatch
+and cannot be replaced with a different thread or authority.
+
+Version 1 is not parsed, migrated, or requeued. Old files remain inert audit
+evidence. A version mismatch returns `unsupported notify-wake contract; cutover
+required`.
 
 ### Register an existing root
 
@@ -155,15 +182,12 @@ async def persist_launch_wake_context(study, run_id, socket_path):
     # Spawn the detached supervisor only after persistence succeeds.
 ```
 
-The notifier passes the recorded profile and approval policy to
-`thread/resume`, verifies the returned effective values, and applies the same
-values to `turn/start`. When `CODEX_PERMISSION_PROFILE` is unset, capture omits
-the override and persists the non-null profile ID resolved by app-server,
-including an implicit built-in ID. A missing or null effective profile fails
-before dispatch. Verification happens before a blocked goal can be reactivated.
-A legacy null-profile context requires explicit recovery, and a missing field or
-any mismatch fails delivery permanently. The worker never maps a legacy context
-to the current default or chooses a broader profile.
+The shared runtime passes the recorded profile and approval policy to
+`thread/resume` and verifies the returned effective values. When
+`CODEX_PERMISSION_PROFILE` is unset, capture omits the override and persists the
+non-null profile ID resolved by app-server, including an implicit built-in ID.
+Missing fields, null profiles, authority mismatches, and pre-0.146 response
+shapes are rejected. The worker never chooses a broader profile.
 
 ## Record terminal state from project code
 
@@ -189,7 +213,11 @@ terminal, notification = record_terminal_event(
 )
 ```
 
-The originating task defaults to `CODEX_THREAD_ID`. Pass `originating_thread_id=` when the host exposes the ID through another trusted source. `record_terminal_event` loads the previously persisted wake context. A missing task ID or wake context produces durable terminal state, but the notification worker marks delivery failed because it has no safe destination or permission context.
+The originating task defaults to `CODEX_THREAD_ID`. Pass
+`originating_thread_id=` when the host exposes the ID through another trusted
+source. Version-2 notifications require a non-null task ID. A missing wake
+context produces durable terminal state, but delivery becomes `blocked` because
+there is no safe authority context.
 
 If the process stops after `terminal.json` is synced but before `notification.json` is queued, reconstruct the pending event with:
 
@@ -223,25 +251,23 @@ The helper stores internal HTML-comment metadata with each complete Markdown blo
 
 Repository code requires an existing daemon. It never starts, restarts, or stops app-server. The operator owns daemon lifecycle and authentication.
 
-With Codex CLI 0.145.0, start and inspect the managed local daemon outside this repository:
+With Codex CLI 0.146.0 or later, start and inspect the managed local daemon outside this repository:
 
 ```bash
 codex app-server daemon start
 codex app-server daemon version
 ```
 
-The implementation baseline is app-server schema 0.145.0, including the
-persistent-goal APIs used to reactivate blocked research goals. Later compatible
-versions can work, but unknown statuses, fields, protocol errors, and lifecycle
-races remain queued instead of being guessed around. Review the current
+The implementation baseline is the schema-conforming Codex 0.146.0 app-server.
+Missing fields, null permission profiles, old response shapes, and old state
+contracts are rejected rather than inferred. Review the current
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server.md)
 before changing the client.
 
 ## Deliver through the daemon Unix socket
 
-The worker connects directly with a WebSocket handshake over the daemon's
-local Unix socket. By default it discovers the running socket through
-`codex app-server daemon version`:
+The shared runtime connects to the daemon's local Unix socket and discovers it
+through `codex app-server daemon version` by default:
 
 ```bash
 uv run python scripts/research.py notify-worker --once \
@@ -249,10 +275,8 @@ uv run python scripts/research.py notify-worker --once \
 ```
 
 Use `--socket /absolute/path/to/app-server.sock` to select a non-default daemon
-socket. The client disables WebSocket compression and the user-agent header and
-accepts app-server messages up to 16 MiB. Do not expose an unauthenticated
-app-server listener on a shared or public network. TCP WebSocket support is
-experimental and is not implemented by this template.
+socket. Do not expose an unauthenticated app-server listener on a shared or
+public network.
 
 ## CLI behavior
 
@@ -287,35 +311,36 @@ Exit codes are:
 | `1` | Validation or delivery problems remain, including a scheduled retry or failed event. |
 | `2` | The invocation is invalid, or the CLI encountered a runtime or I/O failure. |
 
-`notify` is a state acknowledgement interface. It can reconstruct a missing notification and reset a failed event with `--requeue`, but it cannot record app-server acceptance. Only `notify-worker` writes `accepted` after a successful `turn/start` or `turn/steer` response.
+`notify` is a state acknowledgement interface. It can reconstruct a missing
+notification and explicitly requeue a `blocked` event, but it cannot record
+app-server acceptance. Only `notify-worker` writes `accepted` after a successful
+delivery or history reconciliation.
 
 ## Delivery lifecycle
 
-| State | Worker action | Next state |
-| --- | --- | --- |
-| `pending`, not due | Skip this sweep | `pending` |
-| `pending`, blocked goal | Set the goal to `active`, then deliver by task state | Continue below |
-| `pending`, idle task | Send `turn/start` | `accepted` after the response |
-| `pending`, active task | Send `turn/steer` with the newest in-progress turn's expected ID | `accepted` after the response |
-| `pending`, connection or protocol failure | Record one attempt and full-jitter backoff | `pending` |
-| `pending`, permanently invalid or eighth failed attempt | Stop automatic delivery | `failed` |
-| `failed`, explicit `notify --requeue` | Reset delivery metadata | `pending` |
-| `accepted` | Deduplicate by event ID under the task lock | `accepted` |
+The shared state machine uses `pending`, `in_flight`, `uncertain`, `retry_due`,
+`accepted`, and `blocked`. The event ID is also the
+`clientUserMessageId`. Request boundaries are durable before transport writes,
+and an uncertain acknowledgement is reconciled against complete task history
+before any resend. Backoff starts at 5 seconds, doubles per attempt, caps at 300
+seconds, and uses full jitter.
 
-Backoff starts at 5 seconds, doubles per attempt, caps at 300 seconds, and uses full jitter. Each worker sweep records at most one attempt per due event. Acceptance is also recorded in a per-task ledger, and the event ID is sent as `clientUserMessageId` for app-server deduplication.
+`research_compatibility` is the package and worker default. It starts an idle
+root task or steers the exact active turn. `strict` is an explicit opt-in that
+blocks idle starts and owned goal reactivation. The idle read and start are not
+atomic because Codex 0.146.0 has no atomic idle-start precondition.
 
-Before waking the task, the worker queries its persistent goal. It reactivates
-only a `blocked` goal. Explicit `paused`, `complete`, `usageLimited`, and
-`budgetLimited` states are preserved, and a task without a goal is still
-deliverable.
+After a controller is durably armed, enter notify wait when the goal is active,
+the goal API permits blocking, and no implementation, analysis, state
+transition, or other immediate work remains. The shared `enter_notify_wait()`
+records the goal identity and acknowledged blocked `updatedAt`. Delivery may
+reactivate only that exact owned lease. A blocked goal without the lease, with
+changed metadata, or with an uncertain transition is treated as manually
+blocked and remains untouched.
 
-After an adapter dispatches a round, it should verify supervisor identities and
-durable startup state, then return the originating goal to its event-wait state
-immediately when the goal API and higher-priority policy permit it. Apply the
-same transition after a nonterminal lifecycle event when no immediate mutation
-remains. The next accepted event reactivates a blocked goal. This avoids
-back-to-back automatic continuations whose only result is that training remains
-active.
+Goal reads and writes are also non-atomic because Codex 0.146.0 has no
+compare-and-set operation. Exact `createdAt`, objective hash, token budget, and
+`updatedAt` checks detect changes around the race but cannot close it.
 
 The wake message contains only validated identifiers, terminal status, and the absolute `terminal.json` path:
 
@@ -360,18 +385,19 @@ sparse fallback:
 uv run python scripts/research.py notify-worker --once --root logs/research
 ```
 
-Create and own that schedule in the ChatGPT desktop app. Explicitly select
-GPT-5.6 Luna with medium reasoning once in the scheduled-task configuration;
-do not inherit a higher-cost chat default. A scheduled task inside the
-originating chat retains that chat's context. Keep the computer on, the app
-running, and the repository available. This template does not create or modify
-schedules. See the [scheduled tasks documentation](https://learn.chatgpt.com/docs/automations.md).
+Create and own that schedule in the ChatGPT desktop app. GPT-5.6 Luna with
+medium reasoning is appropriate for a read-only scheduled check, dedicated
+relay task, model-selectable subagent, or other low-value non-mutating work.
+Such a relay may inspect durable evidence and send a concise message to the root
+agent. The root model retains launches, recovery, goal changes, scientific
+decisions, and code changes.
 
-App-server `turn/start` also accepts `model` and `effort` overrides, so a
-dedicated idle monitor wake can select `gpt-5.6-luna` and `medium`
-automatically. `turn/steer` cannot replace the model of an active turn. The
-template notifier sends the override when starting an idle task; adapters inherit
-that automatic event-wake selection.
+Root delivery never includes `model` or `effort` in `turn/start`; Codex 0.146.0
+persists root start overrides into later turns. `turn/steer` retains the active
+turn's model. Agent-mail wake behavior may optimize a relay when supported, but
+direct root delivery remains the correctness path. Keep the computer on, the
+app running, and the repository available. This template does not create or
+modify schedules.
 
 Usage reporting is opportunistic. During an existing monitoring, terminal, or
 handoff report, sample current Codex rate-limit telemetry once when available
@@ -444,7 +470,7 @@ make types             # Basedpyright
 make test              # full suite with branch coverage, minimum 90 percent
 make test-compat       # full suite without coverage for compatibility legs
 make test-notify-loop  # focused fake-server sleep/wake/notify integration tests
-make audit             # hash-checked pip-audit across all locked groups
+make audit             # hash-check registry deps; shared runtime is exact-SHA pinned
 make check             # all non-rewriting gates
 make package-check     # build one wheel and sdist, then import the wheel
 ```

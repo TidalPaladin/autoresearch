@@ -27,8 +27,6 @@ THREAD_ID = "subscription-free-terminal-content-sentinel"
 PERMISSION_PROFILE = ":ci-notify-loop"
 APPROVAL_POLICY = "never"
 ACCEPTED_TURN_ID = "fake-notify-turn"
-WAKE_MODEL = "gpt-5.6-luna"
-WAKE_EFFORT = "medium"
 OCCURRED_AT = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 REMOVED_ENVIRONMENT_MARKERS = ("CHATGPT", "CODEX", "OPENAI")
 
@@ -52,13 +50,17 @@ def _isolated_environment(tmp_path: Path) -> dict[str, str]:
 
 def _persist_terminal_state(tmp_path: Path, run_id: str) -> tuple[StudyConfig, Path, Path]:
     study = StudyConfig(id="notify-loop", log_root=tmp_path / "state")
-    context = WakeContext(
-        thread_id=THREAD_ID,
-        permission_profile=PERMISSION_PROFILE,
-        approval_policy=APPROVAL_POLICY,
-        captured_at=OCCURRED_AT,
+    persist_wake_context(
+        study,
+        run_id,
+        WakeContext(
+            thread_id=THREAD_ID,
+            permission_profile=PERMISSION_PROFILE,
+            approval_policy=APPROVAL_POLICY,
+            captured_at=OCCURRED_AT,
+            goal_snapshot=None,
+        ),
     )
-    persist_wake_context(study, run_id, context)
     terminal, _notification = record_terminal_event(
         study,
         run_id,
@@ -95,26 +97,15 @@ async def _run_worker(
         stderr=asyncio.subprocess.PIPE,
     )
     stdout_bytes, stderr_bytes = await process.communicate()
-    return_code = process.returncode
-    assert return_code is not None
-    return (
-        return_code,
-        stdout_bytes.decode(),
-        stderr_bytes.decode(),
-    )
+    assert process.returncode is not None
+    return process.returncode, stdout_bytes.decode(), stderr_bytes.decode()
 
 
-def _response_for(
-    message: dict[str, Any],
-    *,
-    goal_status: str,
-) -> tuple[dict[str, Any] | None, str]:
+def _response_for(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
-    if not isinstance(method, str):
-        return None, goal_status
     request_id = message.get("id")
     if request_id is None:
-        return None, goal_status
+        return None
     if method == "initialize":
         result: dict[str, Any] = {"userAgent": "subscription-free-fake"}
     elif method == "thread/resume":
@@ -128,20 +119,7 @@ def _response_for(
             "approvalPolicy": APPROVAL_POLICY,
         }
     elif method == "thread/goal/get":
-        result = {
-            "goal": {
-                "threadId": THREAD_ID,
-                "status": goal_status,
-            }
-        }
-    elif method == "thread/goal/set":
-        goal_status = str(message["params"]["status"])
-        result = {
-            "goal": {
-                "threadId": THREAD_ID,
-                "status": goal_status,
-            }
-        }
+        result = {"goal": None}
     elif method == "thread/read":
         result = {
             "thread": {
@@ -153,14 +131,11 @@ def _response_for(
     elif method == "turn/start":
         result = {"turn": {"id": ACCEPTED_TURN_ID}}
     else:
-        return (
-            {
-                "id": request_id,
-                "error": {"code": -32601, "message": f"unexpected method: {method}"},
-            },
-            goal_status,
-        )
-    return {"id": request_id, "result": result}, goal_status
+        return {
+            "id": request_id,
+            "error": {"code": -32601, "message": f"unexpected method: {method}"},
+        }
+    return {"id": request_id, "result": result}
 
 
 async def _exercise_success(tmp_path: Path) -> None:
@@ -168,14 +143,12 @@ async def _exercise_success(tmp_path: Path) -> None:
     terminal_before = terminal_path.read_bytes()
     socket_path = tmp_path / "fake.sock"
     messages: list[dict[str, Any]] = []
-    goal_status = "blocked"
 
     async def fake_app_server(websocket: Any) -> None:
-        nonlocal goal_status
         async for raw_message in websocket:
             message = json.loads(raw_message)
             messages.append(message)
-            response, goal_status = _response_for(message, goal_status=goal_status)
+            response = _response_for(message)
             if response is not None:
                 await websocket.send(json.dumps(response))
 
@@ -212,7 +185,6 @@ async def _exercise_success(tmp_path: Path) -> None:
     assert persisted.attempt_count == 1
     assert persisted.accepted_rpc_method == "turn/start"
     assert persisted.accepted_turn_id == ACCEPTED_TURN_ID
-    assert goal_status == "active"
 
     methods = [message["method"] for message in messages]
     assert methods == [
@@ -220,18 +192,9 @@ async def _exercise_success(tmp_path: Path) -> None:
         "initialized",
         "thread/resume",
         "thread/goal/get",
-        "thread/goal/set",
         "thread/read",
         "turn/start",
     ]
-    resume = next(message for message in messages if message["method"] == "thread/resume")
-    assert resume["params"] == {
-        "threadId": THREAD_ID,
-        "permissions": PERMISSION_PROFILE,
-        "approvalPolicy": APPROVAL_POLICY,
-    }
-    goal_set = next(message for message in messages if message["method"] == "thread/goal/set")
-    assert goal_set["params"] == {"threadId": THREAD_ID, "status": "active"}
     start = next(message for message in messages if message["method"] == "turn/start")
     expected_prompt = (
         "Research run completed.\n"
@@ -243,15 +206,11 @@ async def _exercise_success(tmp_path: Path) -> None:
     )
     assert start["params"] == {
         "threadId": THREAD_ID,
-        "permissions": PERMISSION_PROFILE,
-        "approvalPolicy": APPROVAL_POLICY,
         "input": [{"type": "text", "text": expected_prompt}],
         "clientUserMessageId": EVENT_ID,
-        "model": WAKE_MODEL,
-        "effort": WAKE_EFFORT,
     }
-    assert THREAD_ID not in expected_prompt
-    assert '"schema_version"' not in expected_prompt
+    assert "model" not in start["params"]
+    assert "effort" not in start["params"]
 
 
 def test_notify_worker_completes_subscription_free_fake_server_loop(tmp_path: Path) -> None:
@@ -282,10 +241,9 @@ async def _exercise_outage(tmp_path: Path) -> None:
     assert len(payload["problems"]) == 1
     assert str(notification_path) in payload["problems"][0]
     assert str(tmp_path / "unavailable.sock") in payload["problems"][0]
-    assert "No such file or directory" in payload["problems"][0]
     assert terminal_path.read_bytes() == terminal_before
     persisted = read_notification_event(notification_path, study.log_root)
-    assert persisted.state == "pending"
+    assert persisted.state == "retry_due"
     assert persisted.status == "completed"
     assert persisted.attempt_count == 1
     assert persisted.last_attempt_at is not None

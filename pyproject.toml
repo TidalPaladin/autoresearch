@@ -14,8 +14,8 @@ authors = [
 ]
 dependencies = [
     "filelock==3.31.1",
+    "notify-wake-runtime==1.0.0",
     "pyyaml==6.0.3",
-    "websockets==16.1.1",
 ]
 readme = "README.md"
 dynamic = [
@@ -98,6 +98,9 @@ filterwarnings = []
 
 [tool.uv]
 required-version = "==0.11.28"
+
+[tool.uv.sources]
+notify-wake-runtime = { git = "https://github.com/TidalPaladin/skills.git", rev = "61a4a819c58243d54e3c99c684ec23ad88e6dfef", subdirectory = "notify-wake" }
 
 [tool.hatch.version]
 source = "vcs"

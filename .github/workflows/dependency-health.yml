@@ -52,10 +52,11 @@ jobs:
         run: |
           uv sync --frozen --all-groups
           test "$(uv run --frozen pip-audit --version)" = "pip-audit 2.10.1"
-      - name: Export every locked dependency group with hashes
+      - name: Export locked registry dependencies with hashes
         run: |
           mkdir -p reports/security
           uv export --quiet --frozen --all-groups --no-emit-project \
+            --no-emit-package notify-wake-runtime \
             --format requirements-txt \
             --output-file reports/security/locked-requirements.txt
       - name: Audit against PyPI advisories

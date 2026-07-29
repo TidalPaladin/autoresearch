@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -113,6 +113,27 @@ def test_persisted_wake_context_is_loaded_and_cannot_be_replaced(study: StudyCon
             "pretrain-baseline-seed0",
             replace(context, permission_profile=":workspace"),
         )
+
+
+def test_persisted_wake_context_accepts_recapture_of_same_authority(study: StudyConfig) -> None:
+    run_id = "pretrain-baseline-seed0"
+    context = WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=":danger-full-access",
+        approval_policy="never",
+        captured_at=OCCURRED_AT,
+    )
+    context_path = persist_wake_context(study, run_id, context)
+    original_payload = context_path.read_text()
+
+    persisted_path = persist_wake_context(
+        study,
+        run_id,
+        replace(context, captured_at=OCCURRED_AT + timedelta(hours=1)),
+    )
+
+    assert persisted_path == context_path
+    assert context_path.read_text() == original_payload
 
 
 def test_record_archives_prior_pair_before_replacement(study: StudyConfig) -> None:

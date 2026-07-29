@@ -159,6 +159,14 @@ class WakeContext:
             "captured_at": self.captured_at.isoformat(),
         }
 
+    def has_same_authority(self, other: WakeContext) -> bool:
+        """Return whether two captures identify the same effective execution authority."""
+        return (
+            self.thread_id == other.thread_id
+            and self.permission_profile == other.permission_profile
+            and self.approval_policy == other.approval_policy
+        )
+
     def resume_params(self) -> dict[str, Any]:
         approval_policy = cast(ApprovalPolicy, self.approval_policy)
         params = {

@@ -754,7 +754,7 @@ def persist_wake_context(
     with FileLock(str(run_dir / STATE_LOCK_NAME)):
         current = _read_wake_context(run_dir, study.log_root)
         if current is not None:
-            if current != context:
+            if not current.has_same_authority(context):
                 raise StateValidationError(
                     "managed run already has a different immutable wake context"
                 )

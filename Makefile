@@ -2,6 +2,7 @@
 
 SOURCES = project scripts tests
 UV = uv
+NOTIFY_WAKE_RUNTIME = notify-wake-runtime @ git+https://github.com/TidalPaladin/skills.git@61a4a819c58243d54e3c99c684ec23ad88e6dfef\#subdirectory=notify-wake
 
 format: ## rewrite Python files with Ruff formatting
 	$(UV) run --frozen ruff format $(SOURCES)
@@ -35,6 +36,7 @@ audit: ## scan all locked dependency groups for known advisories
 	audit_requirements="$$(mktemp)"; \
 		trap 'rm -f "$$audit_requirements"' EXIT; \
 		$(UV) export --quiet --frozen --all-groups --no-emit-project \
+			--no-emit-package notify-wake-runtime \
 			--format requirements-txt --output-file "$$audit_requirements"; \
 		$(UV) run --frozen pip-audit --disable-pip --strict --require-hashes \
 			--progress-spinner off -r "$$audit_requirements"
@@ -48,7 +50,10 @@ package-check: ## build a wheel and import it in an isolated environment
 		test "$$wheel_count" -eq 1; \
 		test "$$sdist_count" -eq 1; \
 		wheel="$$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"; \
-		$(UV) run --isolated --no-project --with "$$wheel" python -c "import project"
+		$(UV) run --isolated --no-project \
+			--with "$(NOTIFY_WAKE_RUNTIME)" \
+			--with "$$wheel" \
+			python -c "import notify_wake; import project"
 
 init: ## install all locked dependency groups
 	$(UV) sync --frozen --all-groups

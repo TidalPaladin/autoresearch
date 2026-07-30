@@ -6,12 +6,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import subprocess
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NoReturn, TextIO, cast
+
+from notify_wake import discover_daemon_socket
 
 from project.research.codex_notifications import (
     SweepResult,
@@ -110,7 +110,14 @@ def _render_notification(event: NotificationEvent, options: OutputOptions, strea
         stream.write("\n")
         return
     color = options.uses_color(stream)
-    status_code = {"pending": "1;33", "accepted": "1;32", "failed": "1;31"}[event.state]
+    status_code = {
+        "pending": "1;33",
+        "in_flight": "1;33",
+        "uncertain": "1;31",
+        "retry_due": "1;33",
+        "accepted": "1;32",
+        "blocked": "1;31",
+    }[event.state]
     status = _styled(event.state.upper(), status_code, enabled=color)
     stream.write(f"{status}  research notify  {event.study_id}/{event.run_id}\n")
     if options.quiet:
@@ -196,7 +203,7 @@ def _run_notify(arguments: argparse.Namespace) -> int:
     study = StudyConfig.load(arguments.study)
     event = ensure_notification(study, arguments.run_id, requeue=arguments.requeue)
     _render_notification(event, _output_options(arguments), sys.stdout)
-    return EXIT_PROBLEMS if event.state == "failed" else EXIT_SUCCESS
+    return EXIT_PROBLEMS if event.state in {"blocked", "uncertain"} else EXIT_SUCCESS
 
 
 def _run_register_root(arguments: argparse.Namespace) -> int:
@@ -216,38 +223,11 @@ async def _run_worker_async(arguments: argparse.Namespace) -> int:
     return result.exit_code
 
 
-def _daemon_version_output() -> str:
-    result = subprocess.run(
-        ("codex", "app-server", "daemon", "version"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "could not inspect the Codex app-server daemon")
-    return result.stdout
-
-
-def resolve_daemon_socket(
-    explicit_socket: Path | None,
-    *,
-    daemon_version: Callable[[], str] = _daemon_version_output,
-) -> Path:
+def resolve_daemon_socket(explicit_socket: Path | None) -> Path:
     """Resolve the running daemon's Unix control socket."""
     if explicit_socket is not None:
         return explicit_socket.expanduser().resolve(strict=False)
-    try:
-        payload = json.loads(daemon_version())
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Codex daemon version output is not valid JSON") from error
-    socket_path = (
-        payload.get("socketPath")
-        if isinstance(payload, dict) and payload.get("status") == "running"
-        else None
-    )
-    if not isinstance(socket_path, str) or not socket_path or not Path(socket_path).is_absolute():
-        raise RuntimeError("Codex app-server daemon did not report an absolute running socket path")
-    return Path(socket_path).resolve(strict=False)
+    return discover_daemon_socket()
 
 
 def _runtime_failure(message: str) -> NoReturn:

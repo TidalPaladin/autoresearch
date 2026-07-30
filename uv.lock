@@ -343,6 +343,14 @@ wheels = [
 ]
 
 [[package]]
+name = "notify-wake-runtime"
+version = "1.0.0"
+source = { git = "https://github.com/TidalPaladin/skills.git?subdirectory=notify-wake&rev=61a4a819c58243d54e3c99c684ec23ad88e6dfef#61a4a819c58243d54e3c99c684ec23ad88e6dfef" }
+dependencies = [
+    { name = "websockets" },
+]
+
+[[package]]
 name = "packageurl-python"
 version = "0.17.6"
 source = { registry = "https://pypi.org/simple" }
@@ -510,8 +518,8 @@ name = "python-template"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
+    { name = "notify-wake-runtime" },
     { name = "pyyaml" },
-    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -527,8 +535,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "filelock", specifier = "==3.31.1" },
+    { name = "notify-wake-runtime", git = "https://github.com/TidalPaladin/skills.git?subdirectory=notify-wake&rev=61a4a819c58243d54e3c99c684ec23ad88e6dfef" },
     { name = "pyyaml", specifier = "==6.0.3" },
-    { name = "websockets", specifier = "==16.1.1" },
 ]
 
 [package.metadata.requires-dev]

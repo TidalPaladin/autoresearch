@@ -51,16 +51,17 @@ Use `uv==0.11.28`. Pin direct dependencies and commit `uv.lock`. Preserve Hatch 
 
 - Register each existing research root explicitly with `scripts/research.py register-root --root <path>` before notification discovery. Producers register new roots automatically.
 - Require the exact atomic `.autoresearch-root.json` marker before scanning an existing root. Reject filesystem, home, repository, broad parent, malformed, and symlinked roots.
-- Write and sync `terminal.json` before `notification.json`.
+- Use `$notify-wake` as the single source for app-server delivery, delivery-state, authority, reconciliation, and owned goal-wait behavior. Keep only research event production, trusted prompts, registered roots, controllers, and retry timing in this repository.
+- Write and sync each v2 `terminal.json` before its `notification.json` under `<managed-root>/.notify-wake/v2/`. Treat version-1 state as inert history and reject it with a cutover-required error.
 - Capture the live originating thread's effective permission-profile identity and approval policy before child spawn. When `CODEX_PERMISSION_PROFILE` is unset, omit the override and persist the non-null profile ID resolved by app-server, including an implicit built-in ID. Fail before dispatch if app-server does not report a selectable profile, and store the resolved context in an immutable per-run `wake-context.json`.
 - Use same-directory atomic replacement, file and directory sync, and stable sibling locks.
 - Validate identifiers, schemas, timestamps, matching fields, absolute managed paths, and resolved symlink containment before acting.
-- Archive a different prior current event before replacement. Deduplicate retries by event ID.
+- Preserve every v2 event by stable event ID and advance only the run's current-event pointer.
 - Append shared Markdown research logs through the locked runtime helper. Deduplicate all updates by operation ID and terminal entries by study, run, and attempt.
 - Never delete unmanaged or historical experiment artifacts during autonomous work.
 - Keep generated state under `logs/research/` and out of Git.
 
-Notification failure must never change terminal training status. The runtime records terminal truth. Only notification delivery state can move between `pending`, `accepted`, and `failed`.
+Notification failure must never change terminal training status. The runtime records terminal truth. Only notification delivery state can move among the v2 shared states.
 
 ## Adapter conformance
 
@@ -72,24 +73,18 @@ Notification failure must never change terminal training status. The runtime rec
 - Schedule transient retries from the earliest durable `next_attempt_at` in the non-model controller. Fresh due events remain deliverable while another event backs off; never use a notification-set-wide transport latch. Retry writes must not recursively trigger delivery.
 - Persist controller startup, sweep outcomes, isolated problems, and shutdown or failure locally.
 - Keep read-only and notification-recovery commands independent of training datasets and launch-only environment variables. Validate those prerequisites at preflight or launch and name unresolved variables explicitly.
-- Pin read-only scheduled monitoring to GPT-5.6 Luna with medium reasoning when model selection is available. Record the effective model and any fallback.
+- Use GPT-5.6 Luna with medium reasoning only for read-only scheduled checks, dedicated relay tasks or model-selectable subagents, and other low-value non-mutating work. Never change the model of the active root conversation. The root model retains launches, recovery, goal changes, scientific decisions, and code changes.
 - During a research report turn that is already running, sample current Codex rate-limit telemetry once if available and include a compact usage snapshot. Never create a separate schedule, wake, wait, or polling loop for usage reporting, and do not advance research monitoring counters for it.
 - Treat token-use limits as monitoring-only limits. Count only intervals spent polling or inspecting live experiment state. Exclude initial study setup, implementation, tests, launch preparation and execution, result analysis, and all code or configuration changes during a study. Never use aggregate goal or task token usage to block research. If monitoring-only usage cannot be isolated, report it as unavailable.
-- After verifying supervisor identities and durable startup state for a dispatched round, immediately return the persistent goal to its event-wait state when the goal API and higher-priority policy permit it. Do the same after a nonterminal lifecycle event when no immediate mutation remains. Do not leave the goal active for repeated no-event continuations.
+- After verifying supervisor identities and durable startup state, call the shared owned goal-wait lifecycle when the goal is active, no immediate work remains, and the goal API permits blocking. Do the same after a nonterminal event. A wake may reactivate only the exact blocked goal revision owned by that wait lease. Treat every unmatched, changed, or uncertain blocked goal as manually blocked.
 
 ## App-server ownership
 
-- Require an existing persistent Codex app-server daemon.
-- Do not start, restart, or stop the daemon from repository code.
-- Keep app-server communication out of training and supervisor processes.
-- Connect directly to the running daemon's local Unix socket, discovering it through `codex app-server daemon version` unless the operator supplies an explicit path.
-- Resume with the run's exact captured permission profile and approval policy and verify the returned effective context before querying the originating thread goal. Never hardcode a broader profile or fall back to app-server defaults.
-- Treat a legacy null-profile wake context as requiring explicit recovery; never map it to the current default. Treat an absent or null effective profile or mismatched wake context as a permanent delivery failure. Transition only `blocked` goals to `active`; preserve `paused`, `complete`, `usageLimited`, and `budgetLimited` states.
-- Mark acceptance only after app-server accepts `turn/start` or `turn/steer`.
-- For an idle dedicated monitor turn, prefer a `turn/start` override of `model: gpt-5.6-luna` and `effort: medium`. A `turn/steer` request inherits the active turn's model.
-- Leave unknown states, turn races, protocol errors, and connection failures queued for bounded retry.
-- Never auto-approve an app-server request.
-- Send only the fixed trusted wake prompt. Do not include raw logs, errors, stack traces, training output, or model output.
+- Pin `notify-wake-runtime==1.0.0` by exact Git SHA and require the schema-conforming Codex 0.146.0 app-server baseline.
+- Require an existing daemon. Repository code must not start, restart, or stop it, and training or supervisor processes must not communicate with it.
+- Call the shared runtime for socket discovery, context capture, delivery, reconciliation, and goal wait. Do not add repository-local RPC clients or response compatibility.
+- Use the default `research_compatibility` policy. Its goal transition and idle-start check are best-effort because Codex 0.146.0 has no compare-and-set or atomic idle-start operation. Use `strict` only as an explicit opt-in.
+- Never include `model` or `effort` in a root `turn/start`. Send only the fixed trusted wake prompt, without raw logs, errors, stack traces, training output, or model output.
 
 ## Git and publication
 

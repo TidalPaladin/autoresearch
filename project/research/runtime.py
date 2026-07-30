@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 
 import yaml
 from filelock import FileLock
+from notify_wake.models import NotificationRecord
 
 from project.research.wake_context import (
     WAKE_CONTEXT_FILENAME,
@@ -26,13 +27,18 @@ from project.research.wake_context import (
     WakeContextValidationError,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATE_LOCK_NAME = ".state.lock"
 TERMINAL_FILE_NAME = "terminal.json"
 NOTIFICATION_FILE_NAME = "notification.json"
+NOTIFY_WAKE_DIRECTORY = ".notify-wake"
+NOTIFY_WAKE_CONTRACT = "research-notify-wake-v2"
+NOTIFY_WAKE_ROOT_MARKER = ".notify-wake-root.json"
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TERMINAL_STATUSES = frozenset({"completed", "failed", "crashed", "timed_out", "cancelled"})
-DELIVERY_STATES = frozenset({"pending", "accepted", "failed"})
+DELIVERY_STATES = frozenset(
+    {"pending", "in_flight", "uncertain", "retry_due", "accepted", "blocked"}
+)
 MAX_LAST_ERROR_LENGTH = 500
 MANAGED_ROOT_SCHEMA_VERSION = 1
 MANAGED_ROOT_FILE_NAME = ".autoresearch-root.json"
@@ -46,7 +52,14 @@ RESEARCH_LOG_METADATA_FIELDS = frozenset(
 )
 
 TerminalStatus = Literal["completed", "failed", "crashed", "timed_out", "cancelled"]
-DeliveryState = Literal["pending", "accepted", "failed"]
+DeliveryState = Literal[
+    "pending",
+    "in_flight",
+    "uncertain",
+    "retry_due",
+    "accepted",
+    "blocked",
+]
 
 
 class StateValidationError(ValueError):
@@ -67,6 +80,63 @@ class ManagedRootRegistration:
             "marker": str(self.marker),
             "root": str(self.root),
         }
+
+
+def notification_namespace(managed_root: Path) -> Path:
+    """Return the isolated version-2 research notification namespace."""
+
+    return managed_root.resolve(strict=False) / NOTIFY_WAKE_DIRECTORY / f"v{SCHEMA_VERSION}"
+
+
+def _register_notification_namespace(managed_root: Path) -> Path:
+    namespace = notification_namespace(managed_root)
+    namespace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(namespace, 0o700)
+    marker = namespace / NOTIFY_WAKE_ROOT_MARKER
+    expected: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": NOTIFY_WAKE_CONTRACT,
+        "root_path": str(namespace),
+    }
+    if marker.exists():
+        payload = _load_json(marker)
+        if payload.get("schema_version") != SCHEMA_VERSION:
+            raise StateValidationError("unsupported notify-wake contract; cutover required")
+        if payload != expected:
+            raise StateValidationError("notify-wake root marker is invalid")
+    else:
+        _atomic_write_json(marker, expected)
+    return namespace
+
+
+def notification_path_for_event(managed_root: Path, event_id: str) -> Path:
+    validated_event = _validate_event_id(event_id)
+    return (
+        notification_namespace(managed_root) / "events" / validated_event / NOTIFICATION_FILE_NAME
+    )
+
+
+def _terminal_path_for_event(managed_root: Path, event_id: str) -> Path:
+    return notification_path_for_event(managed_root, event_id).with_name(TERMINAL_FILE_NAME)
+
+
+def _current_event_pointer(managed_root: Path, study_id: str, run_id: str) -> Path:
+    return (
+        notification_namespace(managed_root)
+        / "current"
+        / _validate_identifier(study_id, "study id")
+        / f"{_validate_identifier(run_id, 'run id')}.json"
+    )
+
+
+def _wake_context_path(managed_root: Path, study_id: str, run_id: str) -> Path:
+    return (
+        notification_namespace(managed_root)
+        / "contexts"
+        / _validate_identifier(study_id, "study id")
+        / _validate_identifier(run_id, "run id")
+        / WAKE_CONTEXT_FILENAME
+    )
 
 
 def _validate_identifier(value: object, field_name: str) -> str:
@@ -344,16 +414,13 @@ class TerminalEvent:
             originating_thread_id=payload["originating_thread_id"],
             terminal_state_path=str(resolved_terminal),
         )
-        expected_terminal = (
-            managed_root.resolve(strict=False)
-            / event.study_id
-            / "runs"
-            / event.run_id
-            / TERMINAL_FILE_NAME
+        expected_terminal = _terminal_path_for_event(
+            managed_root,
+            event.event_id,
         ).resolve(strict=False)
         if resolved_terminal != expected_terminal:
             raise StateValidationError(
-                "terminal_state_path does not match the study and run identifiers"
+                "terminal_state_path does not match the version-2 event identity"
             )
         return event
 
@@ -371,23 +438,12 @@ class TerminalEvent:
         }
 
 
-NOTIFICATION_FIELDS = TERMINAL_FIELDS | frozenset(
-    {
-        "state",
-        "attempt_count",
-        "last_attempt_at",
-        "next_attempt_at",
-        "last_error",
-        "accepted_at",
-        "accepted_rpc_method",
-        "accepted_turn_id",
-    }
-)
+NOTIFICATION_FIELDS = TERMINAL_FIELDS | frozenset({"delivery"})
 
 
 @dataclass(frozen=True, slots=True)
 class NotificationEvent:
-    """Durable delivery state for one terminal event."""
+    """Research terminal metadata paired with shared notify-wake delivery state."""
 
     schema_version: int
     event_id: str
@@ -398,81 +454,17 @@ class NotificationEvent:
     occurred_at: datetime
     originating_thread_id: str | None
     terminal_state_path: str
-    state: DeliveryState
-    attempt_count: int
-    last_attempt_at: datetime | None
-    next_attempt_at: datetime | None
-    last_error: str | None
-    accepted_at: datetime | None
-    accepted_rpc_method: str | None
-    accepted_turn_id: str | None
+    delivery: NotificationRecord
     wake_context: WakeContext | None = None
 
     def __post_init__(self) -> None:
         terminal = self.as_terminal()
-        if self.state not in DELIVERY_STATES:
-            raise StateValidationError(f"invalid delivery state: {self.state!r}")
-        if not isinstance(self.attempt_count, int) or isinstance(self.attempt_count, bool):
-            raise StateValidationError("attempt_count must be a non-negative integer")
-        if self.attempt_count < 0:
-            raise StateValidationError("attempt_count must be a non-negative integer")
-        for field_name in ("last_attempt_at", "next_attempt_at", "accepted_at"):
-            value = getattr(self, field_name)
-            if value is not None:
-                object.__setattr__(self, field_name, _normalize_utc(value, field_name))
-        if self.last_error is not None:
-            if not isinstance(self.last_error, str) or not self.last_error:
-                raise StateValidationError("last_error must be a non-empty string or null")
-            if len(self.last_error) > MAX_LAST_ERROR_LENGTH or any(
-                ord(character) < 32 or ord(character) == 127 for character in self.last_error
-            ):
-                raise StateValidationError(
-                    "last_error must be sanitized and at most 500 characters"
-                )
-        for field_name in ("accepted_rpc_method", "accepted_turn_id"):
-            value = getattr(self, field_name)
-            if value is not None and (not isinstance(value, str) or not value):
-                raise StateValidationError(f"{field_name} must be a non-empty string or null")
-        if self.state == "accepted":
-            if self.accepted_at is None or self.accepted_rpc_method not in {
-                "turn/start",
-                "turn/steer",
-            }:
-                raise StateValidationError("accepted notification is missing acceptance metadata")
-            if self.accepted_turn_id is None:
-                raise StateValidationError("accepted notification is missing accepted_turn_id")
-            if (
-                self.last_attempt_at != self.accepted_at
-                or self.next_attempt_at is not None
-                or self.last_error is not None
-            ):
-                raise StateValidationError(
-                    "accepted notification has inconsistent delivery metadata"
-                )
-        elif any(
-            value is not None
-            for value in (self.accepted_at, self.accepted_rpc_method, self.accepted_turn_id)
-        ):
-            raise StateValidationError(
-                "unaccepted notification must not contain acceptance metadata"
-            )
-        if self.state == "failed" and (
-            self.attempt_count < 1
-            or self.last_attempt_at is None
-            or self.next_attempt_at is not None
-            or self.last_error is None
-        ):
-            raise StateValidationError("failed notification has inconsistent delivery metadata")
-        if self.state == "pending":
-            retry_metadata = (self.last_attempt_at, self.next_attempt_at, self.last_error)
-            if self.attempt_count == 0 and any(value is not None for value in retry_metadata):
-                raise StateValidationError(
-                    "new pending notification must not contain retry metadata"
-                )
-            if self.attempt_count > 0 and any(value is None for value in retry_metadata):
-                raise StateValidationError(
-                    "retried pending notification has incomplete retry metadata"
-                )
+        if self.delivery.schema_version != SCHEMA_VERSION:
+            raise StateValidationError("unsupported notify-wake contract; cutover required")
+        if self.delivery.watch_id != self.event_id or self.delivery.event_id != self.event_id:
+            raise StateValidationError("delivery identity does not match the terminal event")
+        if self.delivery.thread_id != self.originating_thread_id:
+            raise StateValidationError("delivery thread does not match the originating thread")
         if (
             self.wake_context is not None
             and self.wake_context.thread_id != self.originating_thread_id
@@ -493,6 +485,38 @@ class NotificationEvent:
             terminal_state_path=self.terminal_state_path,
         )
 
+    @property
+    def state(self) -> str:
+        return self.delivery.state
+
+    @property
+    def attempt_count(self) -> int:
+        return self.delivery.attempt_count
+
+    @property
+    def last_attempt_at(self) -> datetime | None:
+        return self.delivery.last_attempt_at
+
+    @property
+    def next_attempt_at(self) -> datetime | None:
+        return self.delivery.next_attempt_at
+
+    @property
+    def last_error(self) -> str | None:
+        return self.delivery.last_error
+
+    @property
+    def accepted_at(self) -> datetime | None:
+        return self.delivery.accepted_at
+
+    @property
+    def accepted_rpc_method(self) -> str | None:
+        return self.delivery.accepted_rpc_method
+
+    @property
+    def accepted_turn_id(self) -> str | None:
+        return self.delivery.accepted_turn_id
+
     @classmethod
     def from_terminal(
         cls,
@@ -500,6 +524,10 @@ class NotificationEvent:
         *,
         wake_context: WakeContext | None = None,
     ) -> NotificationEvent:
+        if terminal.originating_thread_id is None:
+            raise StateValidationError(
+                "version-2 notifications require an originating Codex thread ID"
+            )
         return cls(
             schema_version=terminal.schema_version,
             event_id=terminal.event_id,
@@ -510,14 +538,11 @@ class NotificationEvent:
             occurred_at=terminal.occurred_at,
             originating_thread_id=terminal.originating_thread_id,
             terminal_state_path=terminal.terminal_state_path,
-            state="pending",
-            attempt_count=0,
-            last_attempt_at=None,
-            next_attempt_at=None,
-            last_error=None,
-            accepted_at=None,
-            accepted_rpc_method=None,
-            accepted_turn_id=None,
+            delivery=NotificationRecord.pending(
+                watch_id=terminal.event_id,
+                event_id=terminal.event_id,
+                thread_id=terminal.originating_thread_id,
+            ),
             wake_context=wake_context,
         )
 
@@ -533,9 +558,12 @@ class NotificationEvent:
         _require_keys(payload, NOTIFICATION_FIELDS, source)
         terminal_payload = {key: payload[key] for key in TERMINAL_FIELDS}
         parsed_terminal = TerminalEvent.from_dict(terminal_payload, source, managed_root)
-        state = payload["state"]
-        if not isinstance(state, str) or state not in DELIVERY_STATES:
-            raise StateValidationError(f"invalid delivery state: {state!r}")
+        try:
+            delivery = NotificationRecord.from_dict(payload["delivery"])
+        except (TypeError, ValueError) as error:
+            raise StateValidationError(
+                f"notification in {source} has invalid shared delivery state: {error}"
+            ) from error
         parsed = cls(
             schema_version=parsed_terminal.schema_version,
             event_id=parsed_terminal.event_id,
@@ -546,18 +574,7 @@ class NotificationEvent:
             occurred_at=parsed_terminal.occurred_at,
             originating_thread_id=parsed_terminal.originating_thread_id,
             terminal_state_path=parsed_terminal.terminal_state_path,
-            state=cast(DeliveryState, state),
-            attempt_count=payload["attempt_count"],
-            last_attempt_at=_parse_datetime(
-                payload["last_attempt_at"], "last_attempt_at", optional=True
-            ),
-            next_attempt_at=_parse_datetime(
-                payload["next_attempt_at"], "next_attempt_at", optional=True
-            ),
-            last_error=payload["last_error"],
-            accepted_at=_parse_datetime(payload["accepted_at"], "accepted_at", optional=True),
-            accepted_rpc_method=payload["accepted_rpc_method"],
-            accepted_turn_id=payload["accepted_turn_id"],
+            delivery=delivery,
         )
         if terminal is not None and parsed.as_terminal() != terminal:
             raise StateValidationError(f"notification in {source} does not match terminal state")
@@ -566,14 +583,7 @@ class NotificationEvent:
     def to_dict(self) -> dict[str, object]:
         return {
             **self.as_terminal().to_dict(),
-            "state": self.state,
-            "attempt_count": self.attempt_count,
-            "last_attempt_at": _isoformat(self.last_attempt_at),
-            "next_attempt_at": _isoformat(self.next_attempt_at),
-            "last_error": self.last_error,
-            "accepted_at": _isoformat(self.accepted_at),
-            "accepted_rpc_method": self.accepted_rpc_method,
-            "accepted_turn_id": self.accepted_turn_id,
+            "delivery": self.delivery.to_dict(),
         }
 
     def with_delivery_failure(
@@ -584,46 +594,42 @@ class NotificationEvent:
         next_attempt_at: datetime | None,
         exhausted: bool,
     ) -> NotificationEvent:
-        return replace(
-            self,
-            state="failed" if exhausted else "pending",
-            attempt_count=self.attempt_count + 1,
-            last_attempt_at=attempted_at,
-            next_attempt_at=None if exhausted else next_attempt_at,
-            last_error=error,
-            accepted_at=None,
-            accepted_rpc_method=None,
-            accepted_turn_id=None,
-        )
+        if exhausted:
+            delivery = self.delivery.mark_blocked(attempted_at=attempted_at, error=error)
+        else:
+            if next_attempt_at is None:
+                raise StateValidationError("retryable delivery requires next_attempt_at")
+            delivery = self.delivery.schedule_retry(
+                attempted_at=attempted_at,
+                error=error,
+                next_attempt_at=next_attempt_at,
+                increment_attempt=self.delivery.state not in {"in_flight", "uncertain"},
+            )
+        return replace(self, delivery=delivery)
 
     def with_acceptance(
         self, *, accepted_at: datetime, rpc_method: str, turn_id: str
     ) -> NotificationEvent:
         return replace(
             self,
-            state="accepted",
-            attempt_count=self.attempt_count + 1,
-            last_attempt_at=accepted_at,
-            next_attempt_at=None,
-            last_error=None,
-            accepted_at=accepted_at,
-            accepted_rpc_method=rpc_method,
-            accepted_turn_id=turn_id,
+            delivery=self.delivery.mark_accepted(
+                accepted_at=accepted_at,
+                rpc_method=rpc_method,
+                turn_id=turn_id,
+            ),
         )
 
     def requeued(self) -> NotificationEvent:
-        if self.state != "failed":
-            raise StateValidationError("only failed notifications can be requeued")
+        if self.state != "blocked":
+            raise StateValidationError("only blocked notifications can be requeued")
+        assert self.originating_thread_id is not None
         return replace(
             self,
-            state="pending",
-            attempt_count=0,
-            last_attempt_at=None,
-            next_attempt_at=None,
-            last_error=None,
-            accepted_at=None,
-            accepted_rpc_method=None,
-            accepted_turn_id=None,
+            delivery=NotificationRecord.pending(
+                watch_id=self.event_id,
+                event_id=self.event_id,
+                thread_id=self.originating_thread_id,
+            ),
         )
 
 
@@ -697,13 +703,12 @@ def validate_managed_root(root: Path) -> Path:
     return resolved
 
 
-def _read_wake_context(run_dir: Path, managed_root: Path) -> WakeContext | None:
-    resolved_run_dir = _resolved_managed_path(
-        run_dir.absolute(),
-        managed_root,
-        "managed run directory",
-    )
-    context_path = resolved_run_dir / WAKE_CONTEXT_FILENAME
+def _read_wake_context(
+    managed_root: Path,
+    study_id: str,
+    run_id: str,
+) -> WakeContext | None:
+    context_path = _wake_context_path(managed_root, study_id, run_id)
     if context_path.is_symlink():
         raise StateValidationError("wake context must not be a symlink")
     if not context_path.exists():
@@ -745,16 +750,20 @@ def persist_wake_context(
     context: WakeContext,
 ) -> Path:
     """Persist one immutable permission context before dispatching a managed run."""
-    if context.permission_profile is None:
-        raise StateValidationError("new wake context must include a selectable permission profile")
     register_managed_root(study.log_root)
     run_dir = study.run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-    context_path = run_dir / WAKE_CONTEXT_FILENAME
-    with FileLock(str(run_dir / STATE_LOCK_NAME)):
-        current = _read_wake_context(run_dir, study.log_root)
+    _register_notification_namespace(study.log_root)
+    context_path = _wake_context_path(study.log_root, study.id, run_id)
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(context_path.parent / STATE_LOCK_NAME)):
+        current = _read_wake_context(study.log_root, study.id, run_id)
         if current is not None:
-            if not current.has_same_authority(context):
+            if (
+                current.thread_id != context.thread_id
+                or current.permission_profile != context.permission_profile
+                or current.approval_policy != context.approval_policy
+            ):
                 raise StateValidationError(
                     "managed run already has a different immutable wake context"
                 )
@@ -984,8 +993,9 @@ def read_notification_event(
     return replace(
         event,
         wake_context=_read_wake_context(
-            Path(event.terminal_state_path).parent,
             managed_root,
+            event.study_id,
+            event.run_id,
         ),
     )
 
@@ -994,40 +1004,15 @@ def write_notification_event(event: NotificationEvent, managed_root: Path) -> No
     """Persist notification delivery state without modifying terminal state."""
 
     validated_root = validate_managed_root(managed_root)
+    expected_path = notification_path_for_event(validated_root, event.event_id)
     terminal_path = _resolved_managed_path(
-        Path(event.terminal_state_path), validated_root, "terminal_state_path"
+        Path(event.terminal_state_path),
+        validated_root,
+        "terminal_state_path",
     )
-    _atomic_write_json(terminal_path.with_name(NOTIFICATION_FILE_NAME), event.to_dict())
-
-
-def _archive_current_pair(run_dir: Path, managed_root: Path, terminal: TerminalEvent) -> None:
-    notification_path = run_dir / NOTIFICATION_FILE_NAME
-    if notification_path.exists():
-        notification = read_notification_event(notification_path, managed_root, terminal=terminal)
-    else:
-        notification = NotificationEvent.from_terminal(
-            terminal,
-            wake_context=_read_wake_context(run_dir, managed_root),
-        )
-    archive_dir = run_dir / "attempts" / f"{terminal.attempt}-{terminal.event_id}"
-    _resolved_managed_path(archive_dir.absolute(), managed_root, "archive path")
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    archived_terminal_path = archive_dir / TERMINAL_FILE_NAME
-    archived_notification_path = archive_dir / NOTIFICATION_FILE_NAME
-    if archived_terminal_path.exists():
-        archived = read_terminal_event(archived_terminal_path, managed_root)
-        if archived != terminal:
-            raise StateValidationError(f"archive collision at {archive_dir}")
-    else:
-        _atomic_write_json(archived_terminal_path, terminal.to_dict())
-    if archived_notification_path.exists():
-        archived_notification = read_notification_event(
-            archived_notification_path, managed_root, terminal=terminal
-        )
-        if archived_notification != notification:
-            raise StateValidationError(f"archive collision at {archive_dir}")
-    else:
-        _atomic_write_json(archived_notification_path, notification.to_dict())
+    if terminal_path.with_name(NOTIFICATION_FILE_NAME) != expected_path:
+        raise StateValidationError("notification path does not match its event identity")
+    _atomic_write_json(expected_path, event.to_dict())
 
 
 def record_terminal_event(
@@ -1043,16 +1028,16 @@ def record_terminal_event(
     """Write terminal state first, then queue its notification.
 
     Repeating the same event ID with identical terminal fields is idempotent.
-    A different current event is archived before replacement.
+    New logical events remain immutable and replace only the run's current pointer.
     """
 
     validated_run = _validate_identifier(run_id, "run id")
     register_managed_root(study.log_root)
     run_dir = study.run_dir(validated_run)
     run_dir.mkdir(parents=True, exist_ok=True)
-    terminal_path = _resolved_managed_path(
-        (run_dir / TERMINAL_FILE_NAME).absolute(), study.log_root, "terminal_state_path"
-    )
+    _register_notification_namespace(study.log_root)
+    selected_event_id = _validate_event_id(event_id or str(uuid4()))
+    terminal_path = _terminal_path_for_event(study.log_root, selected_event_id)
     selected_thread_id = (
         originating_thread_id
         if originating_thread_id is not None
@@ -1060,7 +1045,7 @@ def record_terminal_event(
     )
     terminal = TerminalEvent(
         schema_version=SCHEMA_VERSION,
-        event_id=_validate_event_id(event_id or str(uuid4())),
+        event_id=selected_event_id,
         study_id=study.id,
         run_id=validated_run,
         attempt=_validate_attempt(attempt),
@@ -1069,35 +1054,59 @@ def record_terminal_event(
         originating_thread_id=_validate_thread_id(selected_thread_id),
         terminal_state_path=str(terminal_path),
     )
-    lock = FileLock(str(run_dir / STATE_LOCK_NAME))
+    notification_path = terminal_path.with_name(NOTIFICATION_FILE_NAME)
+    pointer_path = _current_event_pointer(study.log_root, study.id, validated_run)
+    pointer_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(pointer_path.parent / STATE_LOCK_NAME))
     with lock:
         if terminal_path.exists():
             current = read_terminal_event(terminal_path, study.log_root)
-            if current.event_id == terminal.event_id:
-                if current != terminal:
-                    raise StateValidationError(
-                        f"event {terminal.event_id} already exists with different terminal fields"
-                    )
-                notification_path = run_dir / NOTIFICATION_FILE_NAME
-                if notification_path.exists():
-                    notification = read_notification_event(
-                        notification_path, study.log_root, terminal=current
-                    )
-                else:
-                    notification = NotificationEvent.from_terminal(
-                        current,
-                        wake_context=_read_wake_context(run_dir, study.log_root),
-                    )
-                    _atomic_write_json(notification_path, notification.to_dict())
-                return current, notification
-            _archive_current_pair(run_dir, study.log_root, current)
+            if current != terminal:
+                raise StateValidationError(
+                    f"event {terminal.event_id} already exists with different terminal fields"
+                )
+            if notification_path.exists():
+                notification = read_notification_event(
+                    notification_path,
+                    study.log_root,
+                    terminal=current,
+                )
+            else:
+                notification = NotificationEvent.from_terminal(
+                    current,
+                    wake_context=_read_wake_context(
+                        study.log_root,
+                        study.id,
+                        validated_run,
+                    ),
+                )
+                _atomic_write_json(notification_path, notification.to_dict())
+            _atomic_write_json(
+                pointer_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "event_id": terminal.event_id,
+                },
+            )
+            return current, notification
 
         notification = NotificationEvent.from_terminal(
             terminal,
-            wake_context=_read_wake_context(run_dir, study.log_root),
+            wake_context=_read_wake_context(
+                study.log_root,
+                study.id,
+                validated_run,
+            ),
         )
         _atomic_write_json(terminal_path, terminal.to_dict())
-        _atomic_write_json(run_dir / NOTIFICATION_FILE_NAME, notification.to_dict())
+        _atomic_write_json(notification_path, notification.to_dict())
+        _atomic_write_json(
+            pointer_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "event_id": terminal.event_id,
+            },
+        )
         return terminal, notification
 
 
@@ -1107,18 +1116,18 @@ def ensure_notification(
     """Validate or reconstruct one run notification, optionally requeueing failure."""
 
     validate_managed_root(study.log_root)
-    run_dir = study.run_dir(run_id)
-    terminal_path = run_dir / TERMINAL_FILE_NAME
-    notification_path = run_dir / NOTIFICATION_FILE_NAME
-    if not terminal_path.exists():
-        raise StateValidationError(f"terminal state does not exist: {terminal_path}")
-    lock = FileLock(str(run_dir / STATE_LOCK_NAME))
+    pointer_path = _current_event_pointer(study.log_root, study.id, run_id)
+    if not pointer_path.exists():
+        raise StateValidationError(f"version-2 notification pointer does not exist: {pointer_path}")
+    lock = FileLock(str(pointer_path.parent / STATE_LOCK_NAME))
     with lock:
+        pointer = _load_json(pointer_path)
+        if pointer.get("schema_version") != SCHEMA_VERSION:
+            raise StateValidationError("unsupported notify-wake contract; cutover required")
+        event_id = _validate_event_id(pointer.get("event_id"))
+        terminal_path = _terminal_path_for_event(study.log_root, event_id)
+        notification_path = notification_path_for_event(study.log_root, event_id)
         terminal = read_terminal_event(terminal_path, study.log_root)
-        if Path(terminal.terminal_state_path) != terminal_path.resolve(strict=False):
-            raise StateValidationError(
-                "terminal_state_path does not identify the current terminal file"
-            )
         if notification_path.exists():
             notification = read_notification_event(
                 notification_path, study.log_root, terminal=terminal
@@ -1126,7 +1135,11 @@ def ensure_notification(
         else:
             notification = NotificationEvent.from_terminal(
                 terminal,
-                wake_context=_read_wake_context(run_dir, study.log_root),
+                wake_context=_read_wake_context(
+                    study.log_root,
+                    study.id,
+                    run_id,
+                ),
             )
             _atomic_write_json(notification_path, notification.to_dict())
         if requeue:

@@ -55,9 +55,9 @@ def test_record_writes_terminal_before_notification(
             originating_thread_id=THREAD_ID,
         )
 
-    run_dir = study.run_dir("pretrain-baseline-seed0")
-    assert (run_dir / "terminal.json").is_file()
-    assert not (run_dir / "notification.json").exists()
+    terminal_path = runtime._terminal_path_for_event(study.log_root, EVENT_ID)
+    assert terminal_path.is_file()
+    assert not terminal_path.with_name("notification.json").exists()
 
 
 def test_record_is_idempotent_by_event_id_and_uses_environment_thread(
@@ -93,6 +93,7 @@ def test_persisted_wake_context_is_loaded_and_cannot_be_replaced(study: StudyCon
         permission_profile=":danger-full-access",
         approval_policy="never",
         captured_at=OCCURRED_AT,
+        goal_snapshot=None,
     )
     persist_wake_context(study, "pretrain-baseline-seed0", context)
 
@@ -122,6 +123,7 @@ def test_persisted_wake_context_accepts_recapture_of_same_authority(study: Study
         permission_profile=":danger-full-access",
         approval_policy="never",
         captured_at=OCCURRED_AT,
+        goal_snapshot=None,
     )
     context_path = persist_wake_context(study, run_id, context)
     original_payload = context_path.read_text()
@@ -136,7 +138,7 @@ def test_persisted_wake_context_accepts_recapture_of_same_authority(study: Study
     assert context_path.read_text() == original_payload
 
 
-def test_record_archives_prior_pair_before_replacement(study: StudyConfig) -> None:
+def test_record_preserves_prior_event_when_current_pointer_advances(study: StudyConfig) -> None:
     first_terminal, _ = record_terminal_event(
         study,
         "pretrain-baseline-seed0",
@@ -157,14 +159,11 @@ def test_record_archives_prior_pair_before_replacement(study: StudyConfig) -> No
         originating_thread_id=THREAD_ID,
     )
 
-    archive = (
-        study.run_dir("pretrain-baseline-seed0")
-        / "attempts"
-        / f"{first_terminal.attempt}-{first_terminal.event_id}"
-    )
-    assert read_terminal_event(archive / "terminal.json", study.log_root) == first_terminal
-    assert (archive / "notification.json").is_file()
+    first_path = runtime._terminal_path_for_event(study.log_root, first_terminal.event_id)
+    assert read_terminal_event(first_path, study.log_root) == first_terminal
+    assert first_path.with_name("notification.json").is_file()
     assert second_terminal.event_id == second_event_id
+    assert runtime._terminal_path_for_event(study.log_root, second_event_id).is_file()
 
 
 @pytest.mark.parametrize("identifier", ["../escape", "a/b", ".", "..", "", "white space"])
@@ -302,7 +301,7 @@ def test_study_rejects_root_and_invalid_log_root_value(tmp_path: Path) -> None:
     ("field", "value", "message"),
     [
         ("schema_version", True, "schema version"),
-        ("schema_version", 2, "schema version"),
+        ("schema_version", 1, "schema version"),
         ("event_id", 1, "UUID"),
         ("event_id", "not-a-uuid", "UUID"),
         ("event_id", "{12345678-1234-5678-9234-567812345678}", "canonical"),
@@ -356,7 +355,7 @@ def test_terminal_rejects_missing_and_extra_fields(study: StudyConfig) -> None:
         read_terminal_event(path, study.log_root)
 
 
-def test_terminal_path_must_match_study_and_run_identifiers(study: StudyConfig) -> None:
+def test_terminal_path_must_match_event_identity(study: StudyConfig) -> None:
     terminal, _ = record_terminal_event(
         study,
         "run-a",
@@ -366,10 +365,10 @@ def test_terminal_path_must_match_study_and_run_identifiers(study: StudyConfig) 
     )
     path = Path(terminal.terminal_state_path)
     payload = json.loads(path.read_text())
-    payload["run_id"] = "run-b"
+    payload["event_id"] = "22345678-1234-5678-9234-567812345678"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(StateValidationError, match="study and run"):
+    with pytest.raises(StateValidationError, match="event identity"):
         read_terminal_event(path, study.log_root)
 
 
@@ -380,12 +379,12 @@ def test_terminal_path_must_match_study_and_run_identifiers(study: StudyConfig) 
         ({"attempt_count": -1}, "non-negative"),
         ({"attempt_count": True}, "non-negative"),
         ({"last_error": 1}, "last_error"),
-        ({"last_error": "bad\nerror"}, "sanitized"),
-        ({"last_error": "x" * 501}, "sanitized"),
+        ({"last_error": "bad\nerror"}, "control characters"),
+        ({"last_error": "x" * 501}, "non-empty string"),
         ({"state": "accepted"}, "acceptance metadata"),
-        ({"state": "failed"}, "failed notification"),
-        ({"accepted_rpc_method": "turn/start"}, "unaccepted"),
-        ({"attempt_count": 1}, "retry metadata"),
+        ({"state": "failed"}, "unsupported delivery state"),
+        ({"accepted_rpc_method": "turn/start"}, "acceptance metadata"),
+        ({"attempt_count": 1}, "delivery metadata"),
     ],
 )
 def test_notification_field_validation(
@@ -400,7 +399,7 @@ def test_notification_field_validation(
     )
     path = Path(terminal.terminal_state_path).with_name("notification.json")
     payload = json.loads(path.read_text())
-    payload.update(changes)
+    payload["delivery"].update(changes)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(StateValidationError, match=message):
@@ -415,7 +414,7 @@ def test_requeue_rejects_nonfailed_event(study: StudyConfig) -> None:
         status="completed",
         originating_thread_id=THREAD_ID,
     )
-    with pytest.raises(StateValidationError, match="only failed"):
+    with pytest.raises(StateValidationError, match="only blocked"):
         event.requeued()
 
 
@@ -447,32 +446,6 @@ def test_atomic_write_removes_temporary_file_after_serialization_error(tmp_path:
         runtime._atomic_write_json(target, {"bad": object()})
     assert not target.exists()
     assert list(tmp_path.glob("*.tmp")) == []
-
-
-def test_archive_collision_is_rejected(study: StudyConfig) -> None:
-    terminal, _ = record_terminal_event(
-        study,
-        "run-a",
-        attempt=1,
-        status="failed",
-        event_id=EVENT_ID,
-        occurred_at=OCCURRED_AT,
-        originating_thread_id=THREAD_ID,
-    )
-    run_dir = study.run_dir("run-a")
-    archive = run_dir / "attempts" / f"{terminal.attempt}-{terminal.event_id}"
-    archive.mkdir(parents=True)
-    collision = replace(terminal, status="completed")
-    runtime._atomic_write_json(archive / "terminal.json", collision.to_dict())
-
-    with pytest.raises(StateValidationError, match="archive collision"):
-        record_terminal_event(
-            study,
-            "run-a",
-            attempt=2,
-            status="completed",
-            originating_thread_id=THREAD_ID,
-        )
 
 
 def test_registers_and_validates_new_and_existing_managed_roots(tmp_path: Path) -> None:

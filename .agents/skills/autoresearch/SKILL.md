@@ -216,7 +216,12 @@ Write atomic state containing:
 
 Write terminal state atomically on completion, failure, crash, timeout, or cancellation. Resume the same experiment with model, optimizer or scheduler, progress counters, random-state policy, tracker identity, and cumulative active runtime. Do not reset convergence clocks or the monitoring budget after resuming.
 
-After dispatching a round, verify that every launched run has a supervisor identity and durable startup state. Then immediately return the persistent goal to its event-wait state; use `blocked` when the goal API and higher-priority policy permit it. Treat this as normal waiting, not a failed study. Do not leave the goal active merely to generate automatic continuations. If the surface cannot enter the wait state immediately, end the coordinator turn, record the limitation once, and do not poll. A lifecycle notification reactivates a blocked goal.
+After dispatching a round, verify that every launched run has a supervisor
+identity, durable startup state, and an armed notification controller. If the
+goal is active, no immediate work remains, and the goal API permits blocking,
+enter the owned goal-wait lifecycle from `$notify-wake`. Treat this as normal
+waiting, not a failed study. If the surface cannot enter notify wait, end the
+coordinator turn, record the limitation once, and do not poll.
 
 For long-running runs, require the domain adapter to define durable lifecycle
 sources as well as terminal truth. At minimum, consider one recovery-confirming
@@ -226,7 +231,16 @@ local. Lifecycle events must be one-shot and idempotent per run attempt.
 
 ## Lifecycle and terminal notifications
 
-Require the supervisor to write terminal state before notifying Codex. Add a domain-adapter `notify` operation with this logical input for every wake-worthy lifecycle event:
+Apply `$notify-wake` for delivery, authority capture, reconciliation, delivery
+state, and the owned goal-wait lifecycle. Do not reproduce its app-server RPC,
+model-selection, response-shape, or goal-transition rules in a research
+adapter. Pin `notify-wake-runtime==1.0.0` by exact Git SHA and require its Codex
+0.146.0 app-server baseline.
+
+The research adapter retains event production, trusted prompts, registered
+roots, controller behavior, and retry timing. Require the supervisor to write
+terminal truth before a notification. Use this logical input for every
+wake-worthy event:
 
 - unique event identifier;
 - study, run, and attempt identifiers;
@@ -234,46 +248,18 @@ Require the supervisor to write terminal state before notifying Codex. Add a dom
 - absolute event-state path;
 - originating Codex thread identifier.
 
-Require every deliverable event to resolve to the immutable wake context
-captured before its run started. Resume the originating thread with that exact
-permission-profile identity and approval policy, then verify the effective
-profile and policy returned by app-server before querying or changing the
-persistent goal. Apply the same context to `turn/start`. A legacy wake context
-with a null profile requires explicit recovery and must never be mapped to the
-current default. Missing context, an absent or null effective-permission field,
-or any mismatch is a permanent delivery failure that requires explicit
-recovery. Never fall back to app-server defaults or broaden access to make a
-wake succeed.
-
-When supported, resume the recorded thread with the Codex SDK or app-server and inspect its runtime status. App-server clients may use `thread/resume` and `thread/read`; see [Codex App Server](https://developers.openai.com/codex/app-server/). Deliver the wake input according to thread state:
-
-- If the thread is idle, use `turn/start`. For a dedicated read-only monitor
-  turn, set `model` to `gpt-5.6-luna` and `effort` to `medium` when the client
-  supports per-turn overrides. Record the effective model and effort.
-- If a turn is active, use `turn/steer` with the expected active turn identifier.
-  Steering inherits the active turn's model and cannot switch it to Luna.
-- If status is unknown or changes during delivery, keep the event queued and retry after reading status again. Do not start a second concurrent turn.
-
-Before delivering the wake, query the originating thread's persistent goal. If
-its status is `blocked`, transition it to `active` so the lifecycle event can
-resume automatic continuation. Do not override `paused`, `complete`,
-`usageLimited`, or `budgetLimited`; a missing goal does not block delivery.
-
-Serialize wake delivery per thread. Mark an event accepted only after `turn/start` or `turn/steer` accepts it. Prefer the SDK or a local Unix socket. Do not depend on the experimental non-loopback WebSocket transport.
-
 Keep wake prompts small. Include identifiers and the event-state path, not raw logs, stack traces, or other untrusted run output. Re-read and validate persisted state before acting.
 
-Use at-least-once delivery:
-
-- persist a pending event before sending;
-- retry failures with bounded exponential backoff and jitter;
-- record attempts, last error, acceptance time, and final delivery state;
-- deduplicate by event identifier;
-- make repeated delivery safe.
+Store new queues only under `<managed-root>/.notify-wake/v2/`. Version-1 wake
+contexts, queues, ledgers, and responses are inert history. Do not parse,
+migrate, requeue, or conditionally support them.
 
 On receipt, cancel only the terminal run's next routine poll. Leave every unrelated run's routine check count, last interval, and `next_check_at` unchanged. Recompute a study-level watchdog only when that does not mutate another run's polling state. Report the wake time, validate artifacts and provenance, update the research log, and continue the study decision flow.
 
-Treat child exit, nonzero exit status, fatal signal, timeout, and cancellation as terminal events handled by an outer supervisor. A supervisor or host failure can prevent notification. Preserve a sparse watchdog that detects stale heartbeats and missed terminal events. When the current surface supports scheduled tasks, return to the same chat so monitoring retains its context; see [Scheduled tasks](https://learn.chatgpt.com/docs/automations). Configure a read-only scheduled monitor explicitly for GPT-5.6 Luna with medium reasoning instead of inheriting the chat default. If thread resume or model selection is unavailable, record the limitation and use the watchdog as the primary monitor.
+Treat child exit, nonzero exit status, fatal signal, timeout, and cancellation as
+terminal events handled by an outer supervisor. A supervisor or host failure
+can prevent notification. Preserve a sparse watchdog that detects stale
+heartbeats and missed terminal events.
 
 Never keep a model turn open merely to sleep, wait on a process or file, or poll
 at sub-minute intervals. Prefer a local non-model controller that reacts to
@@ -301,15 +287,17 @@ Use event-driven lifecycle notifications as the primary path and sparse polling
 only as a fallback. Do not pair healthy notifications with an interactive
 wait/poll loop. Pin read-only scheduled fallback checks to GPT-5.6 Luna with
 medium reasoning when model selection is available; select it once in the
-scheduled-task configuration or a supported `turn/start` override, not through
-repeated manual changes. A healthy run should need no more than five routine
-checks, including startup, progress, and planned terminal verification. A
-terminal wake event is not a poll.
+scheduled-task configuration or use a dedicated model-selectable relay or
+subagent. Never override the model used by the active root conversation. The
+root model retains goal changes, launches, recovery, scientific decisions, and
+code changes. A healthy run should need no more than five routine checks,
+including startup, progress, and planned terminal verification. A terminal wake
+event is not a poll.
 
-After processing a nonterminal lifecycle event, return the goal to the same
-event-wait state before ending the coordinator turn when no immediate study
-mutation remains. Do not spend automatic goal continuations rediscovering that
-the run is still active.
+After processing a nonterminal lifecycle event, re-enter an owned notify wait
+when no immediate study mutation remains. Only a blocked goal with the exact
+acknowledged lease may be reactivated. Treat unmatched, changed, or uncertain
+blocked goals as manually blocked.
 
 At the start of every coordinator invocation, read each active run's recorded `next_check_at`. Advance counters, inspect progress as a routine check, and calculate a new schedule only for runs whose time is due. Preserve non-due run state byte for byte. A wake for one run does not make any other run due.
 

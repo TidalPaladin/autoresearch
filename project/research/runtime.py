@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -31,6 +32,7 @@ SCHEMA_VERSION = 2
 STATE_LOCK_NAME = ".state.lock"
 TERMINAL_FILE_NAME = "terminal.json"
 NOTIFICATION_FILE_NAME = "notification.json"
+NOTIFICATION_PLAN_FILE_NAME = "notification-plan.json"
 NOTIFY_WAKE_DIRECTORY = ".notify-wake"
 NOTIFY_WAKE_CONTRACT = "research-notify-wake-v2"
 NOTIFY_WAKE_ROOT_MARKER = ".notify-wake-root.json"
@@ -50,8 +52,10 @@ RESEARCH_LOG_MARKER_SUFFIX = " -->"
 RESEARCH_LOG_METADATA_FIELDS = frozenset(
     {"schema_version", "kind", "operation_id", "content_sha256", "terminal"}
 )
+NOTIFICATION_RUNTIME_THRESHOLD_SECONDS = 600.0
 
 TerminalStatus = Literal["completed", "failed", "crashed", "timed_out", "cancelled"]
+ElapsedBasis = Literal["operation", "observation"]
 DeliveryState = Literal[
     "pending",
     "in_flight",
@@ -139,6 +143,10 @@ def _wake_context_path(managed_root: Path, study_id: str, run_id: str) -> Path:
     )
 
 
+def _notification_plan_path(managed_root: Path, study_id: str, run_id: str) -> Path:
+    return _wake_context_path(managed_root, study_id, run_id).with_name(NOTIFICATION_PLAN_FILE_NAME)
+
+
 def _validate_identifier(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not IDENTIFIER_PATTERN.fullmatch(value):
         raise StateValidationError(f"{field_name} is not a safe identifier: {value!r}")
@@ -171,6 +179,23 @@ def _validate_attempt(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise StateValidationError("attempt must be a positive integer")
     return value
+
+
+def _validate_elapsed_basis(value: object) -> ElapsedBasis:
+    if value not in {"operation", "observation"}:
+        raise StateValidationError("elapsed_basis must be 'operation' or 'observation'")
+    return cast(ElapsedBasis, value)
+
+
+def _validate_elapsed_seconds(value: object, field_name: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise StateValidationError(f"{field_name} must be a finite non-negative number")
+    return float(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +364,154 @@ class StudyConfig:
         return _resolved_managed_path(candidate.absolute(), self.log_root, "run path")
 
 
+NOTIFICATION_PLAN_FIELDS = frozenset(
+    {
+        "schema_version",
+        "study_id",
+        "run_id",
+        "operation_started_at",
+        "expected_runtime_seconds",
+        "estimate_basis",
+        "explicit_durable_wake",
+        "notification_authorized",
+        "authorization_reason",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationPlan:
+    """Immutable prelaunch decision for one run's durable notification path."""
+
+    schema_version: int
+    study_id: str
+    run_id: str
+    operation_started_at: datetime
+    expected_runtime_seconds: float | None
+    estimate_basis: str | None
+    explicit_durable_wake: bool
+    notification_authorized: bool
+    authorization_reason: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise StateValidationError("unsupported notify-wake contract; cutover required")
+        object.__setattr__(self, "study_id", _validate_identifier(self.study_id, "study id"))
+        object.__setattr__(self, "run_id", _validate_identifier(self.run_id, "run id"))
+        object.__setattr__(
+            self,
+            "operation_started_at",
+            _normalize_utc(self.operation_started_at, "operation_started_at"),
+        )
+        if self.expected_runtime_seconds is not None:
+            object.__setattr__(
+                self,
+                "expected_runtime_seconds",
+                _validate_elapsed_seconds(
+                    self.expected_runtime_seconds,
+                    "expected_runtime_seconds",
+                ),
+            )
+            if not isinstance(self.estimate_basis, str) or not self.estimate_basis.strip():
+                raise StateValidationError(
+                    "estimate_basis must be recorded when expected runtime is known"
+                )
+        elif self.estimate_basis is not None:
+            raise StateValidationError(
+                "estimate_basis must be null when expected runtime is unknown"
+            )
+        if not isinstance(self.explicit_durable_wake, bool):
+            raise StateValidationError("explicit_durable_wake must be a boolean")
+        expected_authorization = self.explicit_durable_wake or (
+            self.expected_runtime_seconds is not None
+            and self.expected_runtime_seconds > NOTIFICATION_RUNTIME_THRESHOLD_SECONDS
+        )
+        if self.notification_authorized is not expected_authorization:
+            raise StateValidationError("notification authorization does not match launch evidence")
+        expected_reason = (
+            "explicit_durable_wake"
+            if self.explicit_durable_wake
+            else (
+                "estimated_over_600_seconds" if expected_authorization else "bounded_wait_required"
+            )
+        )
+        if self.authorization_reason != expected_reason:
+            raise StateValidationError("notification authorization reason is inconsistent")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        study_id: str,
+        run_id: str,
+        operation_started_at: datetime,
+        expected_runtime_seconds: float | None,
+        estimate_basis: str | None,
+        explicit_durable_wake: bool,
+    ) -> NotificationPlan:
+        authorized = explicit_durable_wake or (
+            expected_runtime_seconds is not None
+            and expected_runtime_seconds > NOTIFICATION_RUNTIME_THRESHOLD_SECONDS
+        )
+        reason = (
+            "explicit_durable_wake"
+            if explicit_durable_wake
+            else "estimated_over_600_seconds"
+            if authorized
+            else "bounded_wait_required"
+        )
+        return cls(
+            schema_version=SCHEMA_VERSION,
+            study_id=study_id,
+            run_id=run_id,
+            operation_started_at=operation_started_at,
+            expected_runtime_seconds=expected_runtime_seconds,
+            estimate_basis=estimate_basis,
+            explicit_durable_wake=explicit_durable_wake,
+            notification_authorized=authorized,
+            authorization_reason=reason,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any], source: Path) -> NotificationPlan:
+        _require_keys(payload, NOTIFICATION_PLAN_FIELDS, source)
+        started_at = _parse_datetime(payload["operation_started_at"], "operation_started_at")
+        assert started_at is not None
+        expected_runtime = payload["expected_runtime_seconds"]
+        if expected_runtime is not None:
+            expected_runtime = _validate_elapsed_seconds(
+                expected_runtime,
+                "expected_runtime_seconds",
+            )
+        estimate_basis = payload["estimate_basis"]
+        if estimate_basis is not None and not isinstance(estimate_basis, str):
+            raise StateValidationError("estimate_basis must be a string or null")
+        return cls(
+            schema_version=payload["schema_version"],
+            study_id=payload["study_id"],
+            run_id=payload["run_id"],
+            operation_started_at=started_at,
+            expected_runtime_seconds=expected_runtime,
+            estimate_basis=estimate_basis,
+            explicit_durable_wake=payload["explicit_durable_wake"],
+            notification_authorized=payload["notification_authorized"],
+            authorization_reason=payload["authorization_reason"],
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "study_id": self.study_id,
+            "run_id": self.run_id,
+            "operation_started_at": _isoformat(self.operation_started_at),
+            "expected_runtime_seconds": self.expected_runtime_seconds,
+            "estimate_basis": self.estimate_basis,
+            "explicit_durable_wake": self.explicit_durable_wake,
+            "notification_authorized": self.notification_authorized,
+            "authorization_reason": self.authorization_reason,
+        }
+
+
 TERMINAL_FIELDS = frozenset(
     {
         "schema_version",
@@ -347,7 +520,10 @@ TERMINAL_FIELDS = frozenset(
         "run_id",
         "attempt",
         "status",
+        "operation_started_at",
         "occurred_at",
+        "elapsed_seconds",
+        "elapsed_basis",
         "originating_thread_id",
         "terminal_state_path",
     }
@@ -364,7 +540,10 @@ class TerminalEvent:
     run_id: str
     attempt: int
     status: TerminalStatus
+    operation_started_at: datetime
     occurred_at: datetime
+    elapsed_seconds: float
+    elapsed_basis: ElapsedBasis
     originating_thread_id: str | None
     terminal_state_path: str
 
@@ -381,7 +560,27 @@ class TerminalEvent:
         object.__setattr__(self, "attempt", _validate_attempt(self.attempt))
         if self.status not in TERMINAL_STATUSES:
             raise StateValidationError(f"invalid terminal status: {self.status!r}")
+        object.__setattr__(
+            self,
+            "operation_started_at",
+            _normalize_utc(self.operation_started_at, "operation_started_at"),
+        )
         object.__setattr__(self, "occurred_at", _normalize_utc(self.occurred_at, "occurred_at"))
+        if self.occurred_at < self.operation_started_at:
+            raise StateValidationError("occurred_at must not be before operation_started_at")
+        object.__setattr__(
+            self,
+            "elapsed_seconds",
+            _validate_elapsed_seconds(self.elapsed_seconds, "elapsed_seconds"),
+        )
+        computed_elapsed = (self.occurred_at - self.operation_started_at).total_seconds()
+        if not math.isclose(self.elapsed_seconds, computed_elapsed, abs_tol=1e-6):
+            raise StateValidationError("elapsed_seconds does not match terminal timestamps")
+        object.__setattr__(
+            self,
+            "elapsed_basis",
+            _validate_elapsed_basis(self.elapsed_basis),
+        )
         object.__setattr__(
             self, "originating_thread_id", _validate_thread_id(self.originating_thread_id)
         )
@@ -390,6 +589,15 @@ class TerminalEvent:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], source: Path, managed_root: Path) -> TerminalEvent:
+        timing_fields = {
+            "operation_started_at",
+            "elapsed_seconds",
+            "elapsed_basis",
+        }
+        if not timing_fields.issubset(payload):
+            raise StateValidationError(
+                "unsupported autoresearch terminal timing contract; cutover required"
+            )
         _require_keys(payload, TERMINAL_FIELDS, source)
         terminal_path_value = payload["terminal_state_path"]
         if not isinstance(terminal_path_value, str):
@@ -403,6 +611,11 @@ class TerminalEvent:
             raise StateValidationError(f"invalid terminal status: {status!r}")
         occurred_at = _parse_datetime(payload["occurred_at"], "occurred_at")
         assert occurred_at is not None
+        operation_started_at = _parse_datetime(
+            payload["operation_started_at"],
+            "operation_started_at",
+        )
+        assert operation_started_at is not None
         event = cls(
             schema_version=payload["schema_version"],
             event_id=payload["event_id"],
@@ -410,7 +623,13 @@ class TerminalEvent:
             run_id=payload["run_id"],
             attempt=payload["attempt"],
             status=cast(TerminalStatus, status),
+            operation_started_at=operation_started_at,
             occurred_at=occurred_at,
+            elapsed_seconds=_validate_elapsed_seconds(
+                payload["elapsed_seconds"],
+                "elapsed_seconds",
+            ),
+            elapsed_basis=_validate_elapsed_basis(payload["elapsed_basis"]),
             originating_thread_id=payload["originating_thread_id"],
             terminal_state_path=str(resolved_terminal),
         )
@@ -432,7 +651,10 @@ class TerminalEvent:
             "run_id": self.run_id,
             "attempt": self.attempt,
             "status": self.status,
+            "operation_started_at": _isoformat(self.operation_started_at),
             "occurred_at": _isoformat(self.occurred_at),
+            "elapsed_seconds": self.elapsed_seconds,
+            "elapsed_basis": self.elapsed_basis,
             "originating_thread_id": self.originating_thread_id,
             "terminal_state_path": self.terminal_state_path,
         }
@@ -451,7 +673,10 @@ class NotificationEvent:
     run_id: str
     attempt: int
     status: TerminalStatus
+    operation_started_at: datetime
     occurred_at: datetime
+    elapsed_seconds: float
+    elapsed_basis: ElapsedBasis
     originating_thread_id: str | None
     terminal_state_path: str
     delivery: NotificationRecord
@@ -480,7 +705,10 @@ class NotificationEvent:
             run_id=self.run_id,
             attempt=self.attempt,
             status=self.status,
+            operation_started_at=self.operation_started_at,
             occurred_at=self.occurred_at,
+            elapsed_seconds=self.elapsed_seconds,
+            elapsed_basis=self.elapsed_basis,
             originating_thread_id=self.originating_thread_id,
             terminal_state_path=self.terminal_state_path,
         )
@@ -535,7 +763,10 @@ class NotificationEvent:
             run_id=terminal.run_id,
             attempt=terminal.attempt,
             status=terminal.status,
+            operation_started_at=terminal.operation_started_at,
             occurred_at=terminal.occurred_at,
+            elapsed_seconds=terminal.elapsed_seconds,
+            elapsed_basis=terminal.elapsed_basis,
             originating_thread_id=terminal.originating_thread_id,
             terminal_state_path=terminal.terminal_state_path,
             delivery=NotificationRecord.pending(
@@ -571,7 +802,10 @@ class NotificationEvent:
             run_id=parsed_terminal.run_id,
             attempt=parsed_terminal.attempt,
             status=parsed_terminal.status,
+            operation_started_at=parsed_terminal.operation_started_at,
             occurred_at=parsed_terminal.occurred_at,
+            elapsed_seconds=parsed_terminal.elapsed_seconds,
+            elapsed_basis=parsed_terminal.elapsed_basis,
             originating_thread_id=parsed_terminal.originating_thread_id,
             terminal_state_path=parsed_terminal.terminal_state_path,
             delivery=delivery,
@@ -721,6 +955,21 @@ def _read_wake_context(
         raise StateValidationError(f"wake context in {context_path} is invalid: {error}") from error
 
 
+def _read_notification_plan(
+    managed_root: Path,
+    study_id: str,
+    run_id: str,
+) -> NotificationPlan | None:
+    plan_path = _notification_plan_path(managed_root, study_id, run_id)
+    if plan_path.is_symlink():
+        raise StateValidationError("notification plan must not be a symlink")
+    if not plan_path.exists():
+        return None
+    if not plan_path.is_file():
+        raise StateValidationError("notification plan must be a file")
+    return NotificationPlan.from_dict(_load_json(plan_path), plan_path)
+
+
 def register_managed_root(root: Path) -> ManagedRootRegistration:
     """Atomically register one safe root without scanning or replacing its contents."""
 
@@ -770,6 +1019,43 @@ def persist_wake_context(
             return context_path
         _atomic_write_json(context_path, context.to_dict())
     return context_path
+
+
+def persist_notification_plan(
+    study: StudyConfig,
+    run_id: str,
+    *,
+    operation_started_at: datetime,
+    expected_runtime_seconds: float | None,
+    estimate_basis: str | None,
+    explicit_durable_wake: bool = False,
+) -> NotificationPlan:
+    """Persist one immutable prelaunch notification eligibility decision."""
+
+    register_managed_root(study.log_root)
+    validated_run = _validate_identifier(run_id, "run id")
+    study.run_dir(validated_run).mkdir(parents=True, exist_ok=True)
+    _register_notification_namespace(study.log_root)
+    plan = NotificationPlan.create(
+        study_id=study.id,
+        run_id=validated_run,
+        operation_started_at=operation_started_at,
+        expected_runtime_seconds=expected_runtime_seconds,
+        estimate_basis=estimate_basis,
+        explicit_durable_wake=explicit_durable_wake,
+    )
+    plan_path = _notification_plan_path(study.log_root, study.id, validated_run)
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(plan_path.parent / STATE_LOCK_NAME)):
+        current = _read_notification_plan(study.log_root, study.id, validated_run)
+        if current is not None:
+            if current != plan:
+                raise StateValidationError(
+                    "managed run already has a different immutable notification plan"
+                )
+            return current
+        _atomic_write_json(plan_path, plan.to_dict())
+    return plan
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -1022,10 +1308,12 @@ def record_terminal_event(
     attempt: int,
     status: TerminalStatus,
     event_id: str | None = None,
+    operation_started_at: datetime,
     occurred_at: datetime | None = None,
+    elapsed_basis: ElapsedBasis,
     originating_thread_id: str | None = None,
-) -> tuple[TerminalEvent, NotificationEvent]:
-    """Write terminal state first, then queue its notification.
+) -> TerminalEvent:
+    """Write terminal source truth without creating notification delivery state.
 
     Repeating the same event ID with identical terminal fields is idempotent.
     New logical events remain immutable and replace only the run's current pointer.
@@ -1038,6 +1326,11 @@ def record_terminal_event(
     _register_notification_namespace(study.log_root)
     selected_event_id = _validate_event_id(event_id or str(uuid4()))
     terminal_path = _terminal_path_for_event(study.log_root, selected_event_id)
+    selected_occurred_at = _normalize_utc(
+        occurred_at or datetime.now(UTC),
+        "occurred_at",
+    )
+    selected_started_at = _normalize_utc(operation_started_at, "operation_started_at")
     selected_thread_id = (
         originating_thread_id
         if originating_thread_id is not None
@@ -1050,11 +1343,13 @@ def record_terminal_event(
         run_id=validated_run,
         attempt=_validate_attempt(attempt),
         status=status,
-        occurred_at=_normalize_utc(occurred_at or datetime.now(UTC), "occurred_at"),
+        operation_started_at=selected_started_at,
+        occurred_at=selected_occurred_at,
+        elapsed_seconds=(selected_occurred_at - selected_started_at).total_seconds(),
+        elapsed_basis=_validate_elapsed_basis(elapsed_basis),
         originating_thread_id=_validate_thread_id(selected_thread_id),
         terminal_state_path=str(terminal_path),
     )
-    notification_path = terminal_path.with_name(NOTIFICATION_FILE_NAME)
     pointer_path = _current_event_pointer(study.log_root, study.id, validated_run)
     pointer_path.parent.mkdir(parents=True, exist_ok=True)
     lock = FileLock(str(pointer_path.parent / STATE_LOCK_NAME))
@@ -1065,22 +1360,6 @@ def record_terminal_event(
                 raise StateValidationError(
                     f"event {terminal.event_id} already exists with different terminal fields"
                 )
-            if notification_path.exists():
-                notification = read_notification_event(
-                    notification_path,
-                    study.log_root,
-                    terminal=current,
-                )
-            else:
-                notification = NotificationEvent.from_terminal(
-                    current,
-                    wake_context=_read_wake_context(
-                        study.log_root,
-                        study.id,
-                        validated_run,
-                    ),
-                )
-                _atomic_write_json(notification_path, notification.to_dict())
             _atomic_write_json(
                 pointer_path,
                 {
@@ -1088,18 +1367,9 @@ def record_terminal_event(
                     "event_id": terminal.event_id,
                 },
             )
-            return current, notification
+            return current
 
-        notification = NotificationEvent.from_terminal(
-            terminal,
-            wake_context=_read_wake_context(
-                study.log_root,
-                study.id,
-                validated_run,
-            ),
-        )
         _atomic_write_json(terminal_path, terminal.to_dict())
-        _atomic_write_json(notification_path, notification.to_dict())
         _atomic_write_json(
             pointer_path,
             {
@@ -1107,13 +1377,85 @@ def record_terminal_event(
                 "event_id": terminal.event_id,
             },
         )
-        return terminal, notification
+        return terminal
+
+
+def _managed_root_for_terminal(terminal: TerminalEvent) -> Path:
+    terminal_path = Path(terminal.terminal_state_path)
+    try:
+        event_directory = terminal_path.parents[0]
+        events_directory = terminal_path.parents[1]
+        version_directory = terminal_path.parents[2]
+        namespace_directory = terminal_path.parents[3]
+        managed_root = terminal_path.parents[4]
+    except IndexError as error:
+        raise StateValidationError("terminal path is not in a managed notify-wake root") from error
+    if (
+        terminal_path.name != TERMINAL_FILE_NAME
+        or event_directory.name != terminal.event_id
+        or events_directory.name != "events"
+        or version_directory.name != f"v{SCHEMA_VERSION}"
+        or namespace_directory.name != NOTIFY_WAKE_DIRECTORY
+    ):
+        raise StateValidationError("terminal path is not in the version-2 event namespace")
+    validated_root = validate_managed_root(managed_root)
+    expected = _terminal_path_for_event(validated_root, terminal.event_id).resolve(strict=False)
+    if terminal_path.resolve(strict=False) != expected:
+        raise StateValidationError("terminal path does not match its managed event identity")
+    return validated_root
+
+
+def _authorized_plan_for_terminal(
+    terminal: TerminalEvent,
+    managed_root: Path,
+) -> NotificationPlan:
+    plan = _read_notification_plan(managed_root, terminal.study_id, terminal.run_id)
+    if plan is None or not plan.notification_authorized:
+        raise StateValidationError("notification was not authorized by the persisted launch plan")
+    if plan.operation_started_at != terminal.operation_started_at:
+        raise StateValidationError(
+            "terminal operation start does not match the persisted launch plan"
+        )
+    return plan
+
+
+def queue_terminal_notification(
+    terminal: TerminalEvent,
+    wake_context: WakeContext,
+) -> NotificationEvent:
+    """Create delivery state for an eligible prepared watch."""
+
+    managed_root = _managed_root_for_terminal(terminal)
+    _authorized_plan_for_terminal(terminal, managed_root)
+    persisted_context = _read_wake_context(
+        managed_root,
+        terminal.study_id,
+        terminal.run_id,
+    )
+    if persisted_context is None or persisted_context != wake_context:
+        raise StateValidationError(
+            "wake context must match the immutable context prepared before launch"
+        )
+    notification_path = notification_path_for_event(managed_root, terminal.event_id)
+    with FileLock(str(notification_path.parent / STATE_LOCK_NAME)):
+        if notification_path.exists():
+            return read_notification_event(
+                notification_path,
+                managed_root,
+                terminal=terminal,
+            )
+        notification = NotificationEvent.from_terminal(
+            terminal,
+            wake_context=wake_context,
+        )
+        _atomic_write_json(notification_path, notification.to_dict())
+        return notification
 
 
 def ensure_notification(
     study: StudyConfig, run_id: str, *, requeue: bool = False
 ) -> NotificationEvent:
-    """Validate or reconstruct one run notification, optionally requeueing failure."""
+    """Recover only a notification that its immutable launch plan authorized."""
 
     validate_managed_root(study.log_root)
     pointer_path = _current_event_pointer(study.log_root, study.id, run_id)
@@ -1128,18 +1470,22 @@ def ensure_notification(
         terminal_path = _terminal_path_for_event(study.log_root, event_id)
         notification_path = notification_path_for_event(study.log_root, event_id)
         terminal = read_terminal_event(terminal_path, study.log_root)
+        _authorized_plan_for_terminal(terminal, study.log_root)
         if notification_path.exists():
             notification = read_notification_event(
                 notification_path, study.log_root, terminal=terminal
             )
         else:
+            wake_context = _read_wake_context(
+                study.log_root,
+                study.id,
+                run_id,
+            )
+            if wake_context is None:
+                raise StateValidationError("eligible notification has no immutable wake context")
             notification = NotificationEvent.from_terminal(
                 terminal,
-                wake_context=_read_wake_context(
-                    study.log_root,
-                    study.id,
-                    run_id,
-                ),
+                wake_context=wake_context,
             )
             _atomic_write_json(notification_path, notification.to_dict())
         if requeue:

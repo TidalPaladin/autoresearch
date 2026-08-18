@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -12,19 +13,26 @@ import pytest
 from project.research import runtime
 from project.research.runtime import (
     NotificationEvent,
+    NotificationPlan,
     StateValidationError,
     StudyConfig,
+    TerminalEvent,
     ensure_notification,
+    persist_notification_plan,
     persist_wake_context,
+    queue_terminal_notification,
     read_notification_event,
     read_terminal_event,
-    record_terminal_event,
+)
+from project.research.runtime import (
+    record_terminal_event as _record_terminal_event,
 )
 from project.research.wake_context import WakeContext
 
 EVENT_ID = "12345678-1234-5678-9234-567812345678"
 THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
 OCCURRED_AT = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+OPERATION_STARTED_AT = OCCURRED_AT - timedelta(seconds=601)
 
 
 @pytest.fixture
@@ -32,9 +40,57 @@ def study(tmp_path: Path) -> StudyConfig:
     return StudyConfig(id="vit-small-baseline-v1", log_root=tmp_path / "logs" / "research")
 
 
+def record_terminal_event(
+    selected_study: StudyConfig,
+    run_id: str,
+    **arguments: Any,
+) -> TerminalEvent:
+    arguments.setdefault("operation_started_at", OPERATION_STARTED_AT)
+    arguments.setdefault("occurred_at", OCCURRED_AT)
+    arguments.setdefault("elapsed_basis", "operation")
+    return _record_terminal_event(selected_study, run_id, **arguments)
+
+
+def wake_context() -> WakeContext:
+    return WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=":danger-full-access",
+        approval_policy="never",
+        captured_at=OCCURRED_AT,
+        goal_snapshot=None,
+    )
+
+
+def prepare_notification(
+    selected_study: StudyConfig,
+    run_id: str,
+    **terminal_arguments: Any,
+) -> tuple[TerminalEvent, NotificationEvent]:
+    context = wake_context()
+    persist_wake_context(selected_study, run_id, context)
+    persist_notification_plan(
+        selected_study,
+        run_id,
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(selected_study, run_id, **terminal_arguments)
+    return terminal, queue_terminal_notification(terminal, context)
+
+
 def test_record_writes_terminal_before_notification(
     study: StudyConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    context = wake_context()
+    persist_wake_context(study, "pretrain-baseline-seed0", context)
+    persist_notification_plan(
+        study,
+        "pretrain-baseline-seed0",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
     original_write = runtime._atomic_write_json
 
     def fail_notification(path: Path, payload: dict[str, object]) -> None:
@@ -42,18 +98,17 @@ def test_record_writes_terminal_before_notification(
             raise OSError("simulated queue failure")
         original_write(path, payload)
 
+    terminal = record_terminal_event(
+        study,
+        "pretrain-baseline-seed0",
+        attempt=1,
+        status="completed",
+        event_id=EVENT_ID,
+        originating_thread_id=THREAD_ID,
+    )
     monkeypatch.setattr(runtime, "_atomic_write_json", fail_notification)
-
     with pytest.raises(OSError, match="queue failure"):
-        record_terminal_event(
-            study,
-            "pretrain-baseline-seed0",
-            attempt=1,
-            status="completed",
-            event_id=EVENT_ID,
-            occurred_at=OCCURRED_AT,
-            originating_thread_id=THREAD_ID,
-        )
+        queue_terminal_notification(terminal, context)
 
     terminal_path = runtime._terminal_path_for_event(study.log_root, EVENT_ID)
     assert terminal_path.is_file()
@@ -82,8 +137,8 @@ def test_record_is_idempotent_by_event_id_and_uses_environment_thread(
     )
 
     assert first == second
-    assert first[0].originating_thread_id == THREAD_ID
-    assert UUID(first[0].event_id).version == 4 or first[0].event_id == EVENT_ID
+    assert first.originating_thread_id == THREAD_ID
+    assert UUID(first.event_id).version == 4 or first.event_id == EVENT_ID
     assert not (study.run_dir("pretrain-baseline-seed0") / "attempts").exists()
 
 
@@ -97,7 +152,14 @@ def test_persisted_wake_context_is_loaded_and_cannot_be_replaced(study: StudyCon
     )
     persist_wake_context(study, "pretrain-baseline-seed0", context)
 
-    _, notification = record_terminal_event(
+    persist_notification_plan(
+        study,
+        "pretrain-baseline-seed0",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
         study,
         "pretrain-baseline-seed0",
         attempt=1,
@@ -106,6 +168,7 @@ def test_persisted_wake_context_is_loaded_and_cannot_be_replaced(study: StudyCon
         occurred_at=OCCURRED_AT,
         originating_thread_id=THREAD_ID,
     )
+    notification = queue_terminal_notification(terminal, context)
 
     assert notification.wake_context == context
     with pytest.raises(StateValidationError, match="different immutable wake context"):
@@ -138,8 +201,185 @@ def test_persisted_wake_context_accepts_recapture_of_same_authority(study: Study
     assert context_path.read_text() == original_payload
 
 
+@pytest.mark.parametrize(
+    ("expected_runtime_seconds", "estimate_basis", "explicit_request", "authorized"),
+    [
+        (601.0, "measured prior run", False, True),
+        (600.0, "measured prior run", False, False),
+        (None, None, False, False),
+        (None, None, True, True),
+    ],
+)
+def test_notification_plan_uses_strict_runtime_gate(
+    study: StudyConfig,
+    expected_runtime_seconds: float | None,
+    estimate_basis: str | None,
+    explicit_request: bool,
+    authorized: bool,
+) -> None:
+    plan = persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=expected_runtime_seconds,
+        estimate_basis=estimate_basis,
+        explicit_durable_wake=explicit_request,
+    )
+
+    assert plan.notification_authorized is authorized
+
+
+def test_ineligible_plan_cannot_queue_or_recover_notification(study: StudyConfig) -> None:
+    context = wake_context()
+    persist_wake_context(study, "run-a", context)
+    persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=600,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        event_id=EVENT_ID,
+        originating_thread_id=THREAD_ID,
+    )
+
+    with pytest.raises(StateValidationError, match="persisted launch plan"):
+        queue_terminal_notification(terminal, context)
+    with pytest.raises(StateValidationError, match="persisted launch plan"):
+        ensure_notification(study, "run-a")
+    assert not Path(terminal.terminal_state_path).with_name("notification.json").exists()
+
+
+def test_notification_plan_is_immutable(study: StudyConfig) -> None:
+    persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+
+    with pytest.raises(StateValidationError, match="different immutable notification plan"):
+        persist_notification_plan(
+            study,
+            "run-a",
+            operation_started_at=OPERATION_STARTED_AT,
+            expected_runtime_seconds=600,
+            estimate_basis="changed estimate",
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"schema_version": 1}, "cutover required"),
+        ({"estimate_basis": None}, "estimate_basis must be recorded"),
+        (
+            {"expected_runtime_seconds": None, "estimate_basis": "not applicable"},
+            "estimate_basis must be null",
+        ),
+        ({"explicit_durable_wake": 1}, "must be a boolean"),
+        ({"notification_authorized": False}, "does not match launch evidence"),
+        ({"authorization_reason": "wrong"}, "reason is inconsistent"),
+    ],
+)
+def test_notification_plan_rejects_inconsistent_persisted_evidence(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    arguments: dict[str, Any] = {
+        "schema_version": 2,
+        "study_id": "study-a",
+        "run_id": "run-a",
+        "operation_started_at": OPERATION_STARTED_AT,
+        "expected_runtime_seconds": 601.0,
+        "estimate_basis": "measured prior run",
+        "explicit_durable_wake": False,
+        "notification_authorized": True,
+        "authorization_reason": "estimated_over_600_seconds",
+    }
+    arguments.update(changes)
+    with pytest.raises(StateValidationError, match=message):
+        NotificationPlan(**cast(Any, arguments))
+
+
+def test_queue_requires_matching_plan_start_and_wake_context(study: StudyConfig) -> None:
+    context = wake_context()
+    persist_wake_context(study, "run-a", context)
+    persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        operation_started_at=OPERATION_STARTED_AT + timedelta(seconds=1),
+        originating_thread_id=THREAD_ID,
+    )
+    with pytest.raises(StateValidationError, match="operation start"):
+        queue_terminal_notification(terminal, context)
+
+    matching_terminal = record_terminal_event(
+        study,
+        "run-a",
+        attempt=2,
+        status="completed",
+        operation_started_at=OPERATION_STARTED_AT,
+        originating_thread_id=THREAD_ID,
+    )
+    changed_context = replace(context, approval_policy="on-request")
+    with pytest.raises(StateValidationError, match="immutable context"):
+        queue_terminal_notification(matching_terminal, changed_context)
+
+
+def test_queue_is_idempotent_after_notification_exists(study: StudyConfig) -> None:
+    terminal, notification = prepare_notification(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        originating_thread_id=THREAD_ID,
+    )
+    assert queue_terminal_notification(terminal, wake_context()) == notification
+
+
+def test_recovery_rejects_wrong_pointer_schema_or_missing_context(study: StudyConfig) -> None:
+    persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        event_id=EVENT_ID,
+        originating_thread_id=THREAD_ID,
+    )
+    with pytest.raises(StateValidationError, match="no immutable wake context"):
+        ensure_notification(study, "run-a")
+
+    pointer = runtime._current_event_pointer(study.log_root, study.id, "run-a")
+    pointer.write_text(json.dumps({"schema_version": 1, "event_id": terminal.event_id}))
+    with pytest.raises(StateValidationError, match="cutover required"):
+        ensure_notification(study, "run-a")
+
+
 def test_record_preserves_prior_event_when_current_pointer_advances(study: StudyConfig) -> None:
-    first_terminal, _ = record_terminal_event(
+    first_terminal = record_terminal_event(
         study,
         "pretrain-baseline-seed0",
         attempt=1,
@@ -149,7 +389,7 @@ def test_record_preserves_prior_event_when_current_pointer_advances(study: Study
         originating_thread_id=THREAD_ID,
     )
     second_event_id = "22345678-1234-5678-9234-567812345678"
-    second_terminal, _ = record_terminal_event(
+    second_terminal = record_terminal_event(
         study,
         "pretrain-baseline-seed0",
         attempt=2,
@@ -161,7 +401,7 @@ def test_record_preserves_prior_event_when_current_pointer_advances(study: Study
 
     first_path = runtime._terminal_path_for_event(study.log_root, first_terminal.event_id)
     assert read_terminal_event(first_path, study.log_root) == first_terminal
-    assert first_path.with_name("notification.json").is_file()
+    assert not first_path.with_name("notification.json").exists()
     assert second_terminal.event_id == second_event_id
     assert runtime._terminal_path_for_event(study.log_root, second_event_id).is_file()
 
@@ -191,7 +431,7 @@ def test_rejects_symlink_escape(tmp_path: Path) -> None:
 
 
 def test_rejects_malformed_and_mismatched_state(study: StudyConfig) -> None:
-    terminal, _ = record_terminal_event(
+    terminal, _ = prepare_notification(
         study,
         "run-a",
         attempt=1,
@@ -214,7 +454,7 @@ def test_rejects_malformed_and_mismatched_state(study: StudyConfig) -> None:
 
 
 def test_rejects_non_absolute_or_outside_terminal_path(study: StudyConfig) -> None:
-    terminal, _ = record_terminal_event(
+    terminal, _ = prepare_notification(
         study,
         "run-a",
         attempt=1,
@@ -240,7 +480,7 @@ def test_rejects_non_absolute_or_outside_terminal_path(study: StudyConfig) -> No
 def test_ensure_notification_recovers_missing_file_and_requeues_failed(
     study: StudyConfig,
 ) -> None:
-    terminal, _ = record_terminal_event(
+    terminal, _ = prepare_notification(
         study,
         "run-a",
         attempt=1,
@@ -319,7 +559,7 @@ def test_study_rejects_root_and_invalid_log_root_value(tmp_path: Path) -> None:
 def test_terminal_field_validation(
     study: StudyConfig, field: str, value: object, message: str
 ) -> None:
-    terminal, _ = record_terminal_event(
+    terminal = record_terminal_event(
         study,
         "run-a",
         attempt=1,
@@ -338,7 +578,7 @@ def test_terminal_field_validation(
 
 
 def test_terminal_rejects_missing_and_extra_fields(study: StudyConfig) -> None:
-    terminal, _ = record_terminal_event(
+    terminal = record_terminal_event(
         study,
         "run-a",
         attempt=1,
@@ -355,8 +595,27 @@ def test_terminal_rejects_missing_and_extra_fields(study: StudyConfig) -> None:
         read_terminal_event(path, study.log_root)
 
 
+def test_terminal_without_timing_evidence_requires_cutover(study: StudyConfig) -> None:
+    terminal = record_terminal_event(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        originating_thread_id=THREAD_ID,
+    )
+    path = Path(terminal.terminal_state_path)
+    payload = json.loads(path.read_text())
+    del payload["operation_started_at"]
+    del payload["elapsed_seconds"]
+    del payload["elapsed_basis"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(StateValidationError, match="cutover required"):
+        read_terminal_event(path, study.log_root)
+
+
 def test_terminal_path_must_match_event_identity(study: StudyConfig) -> None:
-    terminal, _ = record_terminal_event(
+    terminal = record_terminal_event(
         study,
         "run-a",
         attempt=1,
@@ -390,7 +649,7 @@ def test_terminal_path_must_match_event_identity(study: StudyConfig) -> None:
 def test_notification_field_validation(
     study: StudyConfig, changes: dict[str, object], message: str
 ) -> None:
-    terminal, _ = record_terminal_event(
+    terminal, _ = prepare_notification(
         study,
         "run-a",
         attempt=1,
@@ -407,7 +666,7 @@ def test_notification_field_validation(
 
 
 def test_requeue_rejects_nonfailed_event(study: StudyConfig) -> None:
-    _, event = record_terminal_event(
+    _, event = prepare_notification(
         study,
         "run-a",
         attempt=1,
@@ -530,7 +789,7 @@ def test_validation_rejects_invalid_and_mismatched_markers(tmp_path: Path) -> No
 def test_terminal_producer_registers_root_and_recovery_requires_marker(
     study: StudyConfig,
 ) -> None:
-    terminal, _ = record_terminal_event(
+    terminal, _ = prepare_notification(
         study,
         "run-a",
         attempt=1,

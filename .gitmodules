@@ -1,0 +1,4 @@
+[submodule ".agents/skills"]
+	path = .agents/skills
+	url = https://github.com/TidalPaladin/skills.git
+	shallow = true

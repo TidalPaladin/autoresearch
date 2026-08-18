@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          submodules: true
       - name: Set up Python 3.14
         # actions/setup-python v7.0.0
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -88,6 +89,8 @@ jobs:
         run: |
           actionlint
           zizmor --pedantic --strict-collection --offline .github
+      - name: Validate shared skill and runtime source links
+        run: make source-link-check
       - name: Run formatting, lint, and type checks
         run: make format-check lint types
 
@@ -188,6 +191,45 @@ jobs:
       - name: Run subscription-free notification-loop tests
         run: make test-notify-loop
 
+  pytorch:
+    name: PyTorch / Python 3.14
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+          checksum: e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+          cache-suffix: pytorch-py3.14
+          prune-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Verify tool versions
+        run: |
+          python --version
+          uv --version
+          test "$(uv --version | awk '{print $1, $2}')" = "uv 0.11.28"
+      - name: Install locked PyTorch and W&B dependencies
+        run: uv sync --frozen --all-groups --extra pytorch --extra wandb
+      - name: Run PyTorch, Gloo, supervisor, and W&B tests
+        run: make test-pytorch
+
   package:
     name: Package
     runs-on: ubuntu-24.04
@@ -234,6 +276,7 @@ jobs:
       - quality
       - tests
       - notify_loop
+      - pytorch
       - package
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -242,6 +285,7 @@ jobs:
         env:
           NOTIFY_LOOP_RESULT: ${{ needs.notify_loop.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
+          PYTORCH_RESULT: ${{ needs.pytorch.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           TESTS_RESULT: ${{ needs.tests.result }}
         shell: bash
@@ -250,4 +294,5 @@ jobs:
           test "${QUALITY_RESULT}" = "success"
           test "${TESTS_RESULT}" = "success"
           test "${NOTIFY_LOOP_RESULT}" = "success"
+          test "${PYTORCH_RESULT}" = "success"
           test "${PACKAGE_RESULT}" = "success"

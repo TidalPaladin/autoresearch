@@ -11,13 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NoReturn, TextIO, cast
 
-from notify_wake import discover_daemon_socket
+from notify_wake import CutoverError, discover_daemon_socket
 
 from project.research.codex_notifications import (
     SweepResult,
     sweep_notifications,
     unix_connector,
 )
+from project.research.cutover import inventory_legacy_state, write_cutover_manifest
 from project.research.runtime import (
     ManagedRootRegistration,
     NotificationEvent,
@@ -87,6 +88,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_root.add_argument("--root", type=Path, required=True)
     _add_output_arguments(register_root)
+
+    cutover = commands.add_parser(
+        "cutover-inventory",
+        help="inventory pre-timing evidence without migrating it",
+    )
+    cutover.add_argument("--root", type=Path, required=True)
+    cutover.add_argument(
+        "--write-manifest",
+        action="store_true",
+        help="write the immutable manifest when no possible live state exists",
+    )
+    cutover.add_argument(
+        "--source-commit",
+        help="exact lowercase skills commit required with --write-manifest",
+    )
+    _add_output_arguments(cutover)
     return parser
 
 
@@ -212,6 +229,33 @@ def _run_register_root(arguments: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _run_cutover_inventory(arguments: argparse.Namespace) -> int:
+    if arguments.write_manifest and arguments.source_commit is None:
+        raise InvocationError("--source-commit is required with --write-manifest")
+    if not arguments.write_manifest and arguments.source_commit is not None:
+        raise InvocationError("--source-commit requires --write-manifest")
+    inventory = inventory_legacy_state(arguments.root)
+    payload = inventory.to_dict()
+    payload["manifest_written"] = False
+    if arguments.write_manifest:
+        source_commit = arguments.source_commit
+        assert isinstance(source_commit, str)
+        write_cutover_manifest(inventory, source_commit=source_commit)
+        payload["manifest_written"] = True
+    options = _output_options(arguments)
+    if options.format == "json":
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        status = "BLOCKED" if inventory.live_identities else "READY"
+        print(f"{status}  research cutover-inventory  {inventory.file_count} legacy files")
+        if not options.quiet:
+            print(f"\nManifest: {inventory.manifest_path}")
+            print(f"Live identities: {len(inventory.live_identities)}")
+            print(f"Manifest written: {payload['manifest_written']}")
+    return EXIT_PROBLEMS if inventory.live_identities else EXIT_SUCCESS
+
+
 async def _run_worker_async(arguments: argparse.Namespace) -> int:
     connector = unix_connector(resolve_daemon_socket(arguments.socket))
     result = await sweep_notifications(arguments.root, connect=connector)
@@ -245,8 +289,10 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_run_worker_async(arguments))
         if arguments.command == "register-root":
             return _run_register_root(arguments)
+        if arguments.command == "cutover-inventory":
+            return _run_cutover_inventory(arguments)
         raise InvocationError(f"unsupported command: {arguments.command}")
-    except StateValidationError as error:
+    except (CutoverError, StateValidationError) as error:
         print(f"research validation failed: {error}", file=sys.stderr)
         return EXIT_PROBLEMS
     except InvocationError as error:

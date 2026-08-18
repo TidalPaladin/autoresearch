@@ -6,7 +6,7 @@ import os
 import shutil
 import sys
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,9 @@ from websockets.asyncio.server import unix_serve
 
 from project.research.runtime import (
     StudyConfig,
+    persist_notification_plan,
     persist_wake_context,
+    queue_terminal_notification,
     read_notification_event,
     record_terminal_event,
 )
@@ -28,6 +30,7 @@ PERMISSION_PROFILE = ":ci-notify-loop"
 APPROVAL_POLICY = "never"
 ACCEPTED_TURN_ID = "fake-notify-turn"
 OCCURRED_AT = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+OPERATION_STARTED_AT = OCCURRED_AT - timedelta(seconds=601)
 REMOVED_ENVIRONMENT_MARKERS = ("CHATGPT", "CODEX", "OPENAI")
 
 
@@ -50,26 +53,37 @@ def _isolated_environment(tmp_path: Path) -> dict[str, str]:
 
 def _persist_terminal_state(tmp_path: Path, run_id: str) -> tuple[StudyConfig, Path, Path]:
     study = StudyConfig(id="notify-loop", log_root=tmp_path / "state")
+    wake_context = WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=PERMISSION_PROFILE,
+        approval_policy=APPROVAL_POLICY,
+        captured_at=OCCURRED_AT,
+        goal_snapshot=None,
+    )
     persist_wake_context(
         study,
         run_id,
-        WakeContext(
-            thread_id=THREAD_ID,
-            permission_profile=PERMISSION_PROFILE,
-            approval_policy=APPROVAL_POLICY,
-            captured_at=OCCURRED_AT,
-            goal_snapshot=None,
-        ),
+        wake_context,
     )
-    terminal, _notification = record_terminal_event(
+    persist_notification_plan(
+        study,
+        run_id,
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
         study,
         run_id,
         attempt=1,
         status="completed",
         event_id=EVENT_ID,
+        operation_started_at=OPERATION_STARTED_AT,
         occurred_at=OCCURRED_AT,
+        elapsed_basis="operation",
         originating_thread_id=THREAD_ID,
     )
+    queue_terminal_notification(terminal, wake_context)
     terminal_path = Path(terminal.terminal_state_path)
     return study, terminal_path, terminal_path.with_name("notification.json")
 
@@ -201,6 +215,9 @@ async def _exercise_success(tmp_path: Path) -> None:
         "Study: notify-loop\n"
         "Run: success\n"
         "Status: completed\n"
+        f"Occurred at: {OCCURRED_AT.isoformat()}\n"
+        "Elapsed before notification: 601 seconds\n"
+        "Elapsed basis: operation\n"
         f"Terminal state: {terminal_path}\n\n"
         "Inspect the terminal state and continue the study protocol."
     )

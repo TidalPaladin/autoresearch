@@ -88,11 +88,15 @@ class SweepResult:
 def build_wake_prompt(event: NotificationEvent) -> str:
     """Build one fixed prompt from validated research identifiers."""
 
+    elapsed = f"{event.elapsed_seconds:.6f}".rstrip("0").rstrip(".")
     return (
         "Research run completed.\n"
         f"Study: {event.study_id}\n"
         f"Run: {event.run_id}\n"
         f"Status: {event.status}\n"
+        f"Occurred at: {event.occurred_at.isoformat()}\n"
+        f"Elapsed before notification: {elapsed} seconds\n"
+        f"Elapsed basis: {event.elapsed_basis}\n"
         f"Terminal state: {event.terminal_state_path}\n\n"
         "Inspect the terminal state and continue the study protocol."
     )

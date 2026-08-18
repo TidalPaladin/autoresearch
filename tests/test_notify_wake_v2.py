@@ -35,7 +35,9 @@ from project.research.runtime import (
     StudyConfig,
     notification_namespace,
     notification_path_for_event,
+    persist_notification_plan,
     persist_wake_context,
+    queue_terminal_notification,
     read_notification_event,
     record_terminal_event,
     register_managed_root,
@@ -180,16 +182,28 @@ def handler(
 def prepared_event(tmp_path: Path) -> tuple[StudyConfig, NotificationEvent]:
     study = StudyConfig(id="study-a", log_root=tmp_path / "logs")
     register_managed_root(study.log_root)
-    persist_wake_context(study, "run-a", context())
-    _terminal, event = record_terminal_event(
+    wake_context = context()
+    operation_started_at = NOW - timedelta(seconds=601)
+    persist_wake_context(study, "run-a", wake_context)
+    persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=operation_started_at,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
         study,
         "run-a",
         attempt=1,
         status="completed",
         event_id=EVENT_ID,
+        operation_started_at=operation_started_at,
         occurred_at=NOW,
+        elapsed_basis="operation",
         originating_thread_id=THREAD_ID,
     )
+    event = queue_terminal_notification(terminal, wake_context)
     return study, event
 
 
@@ -215,6 +229,52 @@ def test_adapter_metadata_and_prompt_are_deterministic(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert result.to_dict()["problems"] == ["retry due"]
     assert SweepResult().exit_code == 0
+
+
+def test_wake_prompt_includes_fixed_elapsed_evidence(tmp_path: Path) -> None:
+    study = StudyConfig(id="study-a", log_root=tmp_path / "logs")
+    operation_started_at = NOW - timedelta(seconds=601)
+    wake_context = context()
+    persist_wake_context(study, "run-a", wake_context)
+    persist_notification_plan(
+        study,
+        "run-a",
+        operation_started_at=operation_started_at,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
+        study,
+        "run-a",
+        attempt=1,
+        status="completed",
+        event_id=EVENT_ID,
+        operation_started_at=operation_started_at,
+        occurred_at=NOW,
+        elapsed_basis="operation",
+        originating_thread_id=THREAD_ID,
+    )
+    event = queue_terminal_notification(terminal, wake_context)
+
+    assert "Elapsed before notification: 601 seconds" in build_wake_prompt(event)
+
+
+def test_wake_prompt_keeps_elapsed_fixed_across_retry_and_excludes_errors(
+    tmp_path: Path,
+) -> None:
+    _study, event = prepared_event(tmp_path)
+    prompt = build_wake_prompt(event)
+    retry = event.with_delivery_failure(
+        attempted_at=NOW + timedelta(minutes=1),
+        error="private stack trace must stay in delivery state",
+        next_attempt_at=NOW + timedelta(minutes=2),
+        exhausted=False,
+    )
+
+    assert build_wake_prompt(retry) == prompt
+    assert "Elapsed before notification: 601 seconds" in prompt
+    assert "private stack trace" not in prompt
+    assert retry.elapsed_seconds == event.elapsed_seconds
 
 
 def test_direct_delivery_accepts_and_missing_context_is_permanent(tmp_path: Path) -> None:

@@ -1,105 +1,255 @@
-# Python Autoresearch Template
+# PyTorch Autoresearch Template
 
-This repository is a Python project template for recoverable empirical research. It provides durable terminal-event recording and a separate Codex notification worker. Projects created from the template supply their own training, supervision, heartbeat, metrics, and experiment-domain logic.
+This repository is a concrete PyTorch implementation of the domain-neutral
+`$autoresearch` skill. It provides single-node distributed training, completed-epoch
+recovery, optional W&B telemetry, local process supervision, durable research events,
+and `$notify-wake` event production.
 
-The package remains named `project` and the distribution remains named `python-template` so a new project can choose its own names. Versions continue to come from Git through Hatch VCS. The template does not contain a static release version or release tag.
+Downstream projects supply real models, datasets, data loaders, objectives, and study
+definitions. Mid-epoch recovery and multi-node elastic training are out of scope.
 
-## Create a project from the template
+The distribution remains named `python-template` so a new project can choose its own
+name. Hatch VCS derives versions from Git. This change does not add a static version or
+release tag.
 
-1. Rename `project/` to the import package name.
-2. Change `project.research` imports in `scripts/research.py` and the tests.
-3. Change `name = "python-template"` in `pyproject.toml`.
-4. Update the package name used by `make package-check`.
-5. Replace the example study ID in `research/studies/example.yaml`.
-6. Run `uv sync --frozen --all-groups`, then `make check`.
+## Clone and initialize
 
-The repository requires Python 3.12 or later and `uv==0.11.28`. Direct dependencies and build tools are pinned in `pyproject.toml`; `uv.lock` makes the full environment reproducible.
+Clone the template and its shallow skills submodule:
 
-## Continuous integration
-
-GitHub Actions is the CI provider. [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-runs for pull requests to `master`, pushes to `master`, and manual dispatches on
-GitHub-hosted `ubuntu-24.04` runners. It grants only `contents: read` and exposes
-one stable branch-protection check named `Required`. That check succeeds only
-when all of these jobs succeed:
-
-- `Quality`: actionlint, offline pedantic zizmor, formatting, Ruff, and Basedpyright.
-- `Tests / Python 3.12` and `Tests / Python 3.14`: the full suite on both supported
-  minors, with 90 percent branch coverage enforced on Python 3.14.
-- `Notify loop`: focused end-to-end notification delivery and outage behavior.
-- `Package`: exactly one wheel and source distribution plus an isolated import.
-
-The notification-loop job is subscription-free. It starts a temporary
-WebSocket-over-Unix fake app-server and runs the real `notify-worker` CLI through
-an absolute Python executable. The test removes Codex, ChatGPT, and OpenAI
-environment variables, gives the subprocess a `PATH` with no `codex` executable,
-and uses no daemon, API key, network service, or Codex subscription. It verifies
-the fixed wake prompt and durable state without waking a real task.
-
-Two rollout workflows are manual-only until their exact revisions can be
-dispatched from a workflow already present on `master`:
-
-- `production-package.yml` uploads the wheel, source distribution, and verified
-  `SHA256SUMS` as `production-package` for 7 days. Its planned schedule is
-  `17 3 * * 1` (Mondays at 03:17 UTC).
-- `dependency-health.yml` uploads PyPI and OSV audit evidence as
-  `security-audit-evidence` and direct-pin, Python-support, and warning evidence
-  as `deprecation-report`, both for 7 days. Its planned schedule is
-  `23 4 * * 2` (Tuesdays at 04:23 UTC). Security findings and incomplete scans
-  both fail; per-service metadata distinguishes them. Deprecation findings are
-  informational, while network, schema, parsing, and execution failures fail.
-  There are no advisory exceptions. A future exception must name the advisory,
-  supporting evidence, owner, and expiry or review date.
-
-After `Required` first succeeds on `master`, maintainers can add the schedules
-in a second reviewed change and enable the `Require CI on master` ruleset for
-the exact `Required` context with up-to-date branches required. Each scheduled
-workflow revision must first pass an exact-ref manual dispatch and preserve the
-run, head SHA, workflow blob, expected jobs, and artifact or smoke evidence.
-There is no trusted GitHub callback or exact-run local watcher in this
-repository, so automatic Codex wake-up for those dispatches is unavailable;
-resume the originating task manually to collect authoritative run evidence.
-
-## Notification architecture
-
-Training and Codex communication are separate processes:
-
-```text
-launch adapter
-  -> captures the live Codex permission profile and approval policy
-  -> registers the exact managed root and writes v2 wake context
-project worker
-  -> writes immutable v2 terminal truth
-  -> queues the shared v2 delivery record
-  -> notification worker reads the event
-  -> notify-wake-runtime resumes or steers the originating Codex task
+```bash
+git clone --recurse-submodules https://github.com/TidalPaladin/autoresearch.git
+cd autoresearch
+uv sync --frozen --all-groups
+make check
 ```
 
-`project/research/runtime.py` owns research event production and local state.
-`project/research/codex_notifications.py` supplies the trusted prompt, registered
-root, retry timing, and controller integration. The pinned
-`notify-wake-runtime==1.0.0` package owns app-server transport, context capture,
-delivery, reconciliation, shared delivery state, and the goal-wait lease.
-Its source is the canonical `$notify-wake` skill under
-`/home/tidal/skills/notify-wake`.
+If the repository is already cloned, initialize the skill tree explicitly:
 
-A notification error cannot change a terminal status such as `completed`,
-`failed`, or `timed_out`. It changes only the shared delivery record.
-Notification discovery starts only after the worker validates the root's
-registration marker.
-
-## Study and state layout
-
-A study file contains the validated study ID and managed log root:
-
-```yaml
-id: example
-log_root: logs/research
+```bash
+git submodule update --init --depth 1 .agents/skills
 ```
 
-Relative log roots resolve from the current working directory. Run commands from the repository root or load the configuration with an explicit `base_dir` in Python.
+The repository requires Python 3.12 or later and `uv==0.11.28`.
 
-Current state uses this layout:
+## Shared skill and template boundary
+
+The canonical domain-neutral skill is
+`.agents/skills/autoresearch/SKILL.md`. The `.agents/skills` directory is an HTTPS,
+shallow submodule of [`TidalPaladin/skills`](https://github.com/TidalPaladin/skills).
+The gitlink and `notify-wake-runtime==1.0.0` source dependency use the same exact skills
+commit.
+
+The shared skill owns research discipline, study definitions, provenance, local logs,
+resource controls, promotion rules, sparse monitoring, goal handling, and adapter
+requirements. The shared `$notify-wake` runtime owns app-server transport, authority
+capture, delivery state, reconciliation, retries, root-task delivery, and owned goal
+waits.
+
+This template owns these PyTorch-specific mechanisms:
+
+- one-host Gloo on CPU and NCCL on CUDA
+- explicit rank, local-rank, world-size, device, backend, and sampler validation
+- completed-epoch checkpointing and resume
+- process-group supervision and cleanup
+- rank-zero research state, terminal events, log entries, and telemetry
+- optional manifest-gated W&B tracking
+- deterministic synthetic-classification tests and demonstration code
+- research event production and attention predicates.
+
+Do not copy or edit the skill inside this repository. Make shared policy changes in the
+skills repository, merge them, then update all exact pins together.
+
+### Update the shared source
+
+Use a merged commit from the skills repository's `main` branch:
+
+```bash
+git -C .agents/skills fetch origin main
+git -C .agents/skills checkout <merged-skills-sha>
+```
+
+Set the same 40-character SHA in these locations:
+
+- the `.agents/skills` gitlink
+- `[tool.uv.sources].notify-wake-runtime` in `pyproject.toml`
+- `NOTIFY_WAKE_RUNTIME` in `Makefile`
+- the locked Git source in `uv.lock`.
+
+Then refresh and validate:
+
+```bash
+uv lock
+make source-link-check
+git diff --submodule=log
+```
+
+`scripts/validate_source_links.py` fails if the submodule is absent, uninitialized,
+dirty, at the wrong commit, or inconsistent with any runtime pin.
+
+## PyTorch interfaces
+
+Install the optional training dependencies with exact locked versions:
+
+```bash
+uv sync --frozen --all-groups --extra pytorch --extra wandb
+```
+
+The package exports these typed interfaces from `project.research`:
+
+- `TrainingConfig`
+- `DistributedContext`
+- `TrainingComponents`
+- `EpochMetrics`
+- `CheckpointStore`
+- `TorchSupervisor`
+- `WandbTracker`
+
+`TrainingComponents` accepts downstream model, optimizer, loader, loss, and optional
+scheduler objects. A distributed loader must use a `DistributedSampler` whose rank and
+replica count match `DistributedContext`. Call `DistributedContext.initialize()` before
+distributed training and `close()` after all ranks have stopped.
+
+`CheckpointStore` writes `last.pt` through a synced same-directory temporary file and
+atomic replacement. Rank zero writes only after an epoch completes. Each checkpoint
+contains the model, optimizer, optional scheduler, completed epoch, global step, metric
+state, cumulative runtime, and random state for every rank. Resume starts after the last
+completed epoch.
+
+Run the deterministic CPU demonstration with one or two processes:
+
+```bash
+uv run --extra pytorch python scripts/synthetic_classification.py \
+  --backend gloo --world-size 2 --epochs 2
+```
+
+The guarded NCCL target requires at least two visible CUDA devices. It reports `SKIP`
+and exits successfully when the host does not meet that requirement:
+
+```bash
+make cuda-smoke
+```
+
+## W&B contract
+
+W&B is optional and has no standing authorization. The caller must supply an exact
+entity, project, mode (`online`, `offline`, or `disabled`), and emitted-data manifest.
+Only rank zero initializes or writes a run. The tracker emits only manifest-listed
+aggregate fields. Tests use an injected fake client and never contact W&B.
+
+Review the destination, data classification, account, credentials, retention, and
+external-write authorization before selecting `online` mode.
+
+## Notification eligibility
+
+Prepare notification state before launching the supervised process. A launch is eligible
+only when either condition is true:
+
+- the user explicitly requested a durable wake, or
+- the recorded estimate is strictly greater than 600 seconds.
+
+Exactly 600 seconds and unknown estimates use an ordinary bounded wait or status check.
+The persisted plan is immutable and records the estimate basis.
+
+Capture the live Codex wake context through the shared runtime, then persist it with the
+eligible plan. The template does not implement app-server RPCs or infer missing
+authority.
+
+## Terminal-first event production
+
+Terminal truth and notification delivery are separate operations:
+
+```python
+from datetime import UTC, datetime
+from pathlib import Path
+
+from project.research.runtime import (
+    StudyConfig,
+    queue_terminal_notification,
+    record_terminal_event,
+)
+
+study = StudyConfig.load(
+    Path("research/studies/example.yaml"),
+    base_dir=Path.cwd(),
+)
+started_at = datetime.now(UTC)
+
+# Run the supervised operation, then record its terminal outcome.
+terminal = record_terminal_event(
+    study,
+    "pretrain-baseline-seed0",
+    attempt=1,
+    status="completed",
+    operation_started_at=started_at,
+    elapsed_basis="operation",
+)
+
+# Queue only when the persisted plan authorized delivery and the context matches.
+notification = queue_terminal_notification(terminal, wake_context)
+```
+
+`record_terminal_event()` writes source truth only. It stores immutable operation-start
+time, occurrence time, elapsed seconds, and elapsed basis. `queue_terminal_notification()`
+creates delivery state only for an eligible prepared watch. `ensure_notification()` may
+reconstruct only a notification authorized by the persisted launch plan.
+
+Every wake includes the fixed text `Elapsed before notification: <seconds> seconds`.
+Retries reuse the terminal event's elapsed value. Wake payloads contain only identifiers,
+status, timing evidence, and the absolute terminal path. They exclude raw logs, errors,
+stack traces, model output, and training output.
+
+Rank zero is the only writer for checkpoints, progress state, research-log entries,
+terminal events, and W&B telemetry.
+
+## Legacy cutover inventory
+
+Pre-timing adapter records are rejected with a cutover-required error. Inventory them
+without migration or mutation:
+
+```bash
+uv run python scripts/research.py cutover-inventory \
+  --root logs/research --format json
+```
+
+The output always reports the fixed manifest path:
+`<managed-root>/.notify-wake/v2/cutover-manifest.json`. After verifying that no live
+legacy identity exists, write an immutable evidence manifest with the exact merged skills
+commit:
+
+```bash
+uv run python scripts/research.py cutover-inventory \
+  --root logs/research \
+  --write-manifest \
+  --source-commit <merged-skills-sha>
+```
+
+This command hashes and classifies legacy evidence. It does not transform, delete,
+requeue, or migrate a legacy record. It refuses unreadable evidence and delivery states
+that may still be live.
+
+## Notification worker
+
+Repository code requires an existing Codex app-server daemon. It does not start, restart,
+or stop the daemon. Deliver due events once through the daemon's Unix socket:
+
+```bash
+uv run python scripts/research.py notify-worker --once --root logs/research
+```
+
+Use `--socket /absolute/path/to/app-server.sock` for an explicit socket. Inspect or
+recover an authorized run notification with:
+
+```bash
+uv run python scripts/research.py notify research/studies/example.yaml <run-id>
+```
+
+Delivery uses the shared `research_compatibility` policy. Notification failure changes
+only delivery state. It cannot change a terminal training result. The shared owned-goal
+lease may reactivate only the exact blocked goal revision that it owns.
+
+## Local state
+
+Runtime state stays under the managed research root:
 
 ```text
 logs/research/
@@ -107,389 +257,48 @@ logs/research/
   .notify-wake/
     v2/
       .notify-wake-root.json
-      .thread-locks/
-        <sha256-thread-id>.lock
-      goal-waits/
-        <sha256-thread-id>.json
-      contexts/
-        <study-id>/
-          <run-id>/
-            wake-context.json
-      current/
-        <study-id>/
-          <run-id>.json
-      events/
-        <event-id>/
-          terminal.json
-          notification.json
+      contexts/<study-id>/<run-id>/
+        wake-context.json
+        notification-plan.json
+      current/<study-id>/<run-id>.json
+      events/<event-id>/
+        terminal.json
+        notification.json
   <study-id>/
-    .research-log.md.lock
     research-log.md
-    runs/
-      <run-id>/
-        <research artifacts>
+    runs/<run-id>/
 ```
 
-`.autoresearch-root.json` contains an exact schema version, marker kind, and canonical absolute root path. `record_terminal_event` creates it through an atomic same-directory replacement before producing queue state. An existing root without this marker is never scanned. Registration rejects files, filesystem and top-level roots, home directories and their parents, repository roots, broad working-directory parents, symlinked paths, and malformed or mismatched markers.
+State paths must be absolute after resolution, remain inside the declared root, and not
+use symlink components. Generated research state, logs, credentials, and app-server
+schemas stay out of Git.
 
-Every event directory is immutable by event ID. A per-run pointer selects the
-current event without moving or rewriting prior events. Repeating the same event
-ID with the same terminal fields is idempotent. Identifiers cannot contain
-separators, whitespace, or traversal components. Persisted paths must be
-absolute, remain under the declared log root after symlink resolution, and
-match their v2 event identity. `wake-context.json` is written before dispatch
-and cannot be replaced with a different thread or authority.
+## Validation
 
-Version 1 is not parsed, migrated, or requeued. Old files remain inert audit
-evidence. A version mismatch returns `unsupported notify-wake contract; cutover
-required`.
-
-### Register an existing root
-
-Roots created by a terminal-event producer are registered automatically. Register an existing queue before its first worker sweep:
+Run the repository gates with the required uv version:
 
 ```bash
-uv run python scripts/research.py register-root --root logs/research
+make check
+make test-pytorch
+make test-notify-loop
+make package-check
+make cuda-smoke
+git diff --check
 ```
 
-The command is idempotent and does not scan or replace existing queue contents. A nonexistent worker root remains an empty successful sweep, but an existing unregistered root returns validation exit code `1`. Inspect registration as JSON with `--format json`; the document contains `created`, `root`, and `marker`.
-
-Runtime state under `logs/research/` is ignored by Git. Do not commit generated terminal files, notification files, locks, accepted-event ledgers, logs, credentials, or app-server schemas.
-
-## Capture wake context before dispatch
-
-The launch adapter must capture the effective context while the originating
-Codex turn is live, then persist it before spawning the supervisor:
-
-```python
-import os
-
-from project.research.codex_notifications import (
-    UnixWebSocketTransport,
-    capture_wake_context,
-)
-from project.research.runtime import persist_wake_context
-
-
-async def persist_launch_wake_context(study, run_id, socket_path):
-    transport = await UnixWebSocketTransport.connect(socket_path)
-    wake_context = await capture_wake_context(
-        thread_id=os.environ["CODEX_THREAD_ID"],
-        requested_permission_profile=os.environ.get("CODEX_PERMISSION_PROFILE"),
-        transport=transport,
-    )
-    persist_wake_context(study, run_id, wake_context)
-    # Spawn the detached supervisor only after persistence succeeds.
-```
-
-The shared runtime passes the recorded profile and approval policy to
-`thread/resume` and verifies the returned effective values. When
-`CODEX_PERMISSION_PROFILE` is unset, capture omits the override and persists the
-non-null profile ID resolved by app-server, including an implicit built-in ID.
-Missing fields, null profiles, authority mismatches, and pre-0.146 response
-shapes are rejected. The worker never chooses a broader profile.
-
-## Record terminal state from project code
-
-Call `record_terminal_event` from an outer supervisor after it has classified the process outcome. The supervisor remains responsible for timeout enforcement, child exits, signals, checkpoints, and domain-specific recovery.
-
-```python
-from datetime import UTC, datetime
-from pathlib import Path
-
-from project.research.runtime import StudyConfig, record_terminal_event
-
-study = StudyConfig.load(
-    Path("research/studies/example.yaml"),
-    base_dir=Path.cwd(),
-)
-
-terminal, notification = record_terminal_event(
-    study,
-    "pretrain-baseline-seed0",
-    attempt=1,
-    status="completed",
-    occurred_at=datetime.now(UTC),
-)
-```
-
-The originating task defaults to `CODEX_THREAD_ID`. Pass
-`originating_thread_id=` when the host exposes the ID through another trusted
-source. Version-2 notifications require a non-null task ID. A missing wake
-context produces durable terminal state, but delivery becomes `blocked` because
-there is no safe authority context.
-
-If the process stops after `terminal.json` is synced but before `notification.json` is queued, reconstruct the pending event with:
-
-```bash
-uv run python scripts/research.py notify research/studies/example.yaml pretrain-baseline-seed0
-```
-
-## Append the research log
-
-Use `append_research_log` as the single-writer primitive for a shared Markdown study log. It acquires the stable `.research-log.md.lock`, re-reads after locking, creates the header with the first entry, and replaces the log through a synced same-directory temporary file.
-
-```python
-from pathlib import Path
-
-from project.research.runtime import TerminalLogIdentity, append_research_log
-
-append_research_log(
-    Path("logs/research/example/research-log.md"),
-    managed_root=Path("logs/research"),
-    header_operation_id="example-header",
-    header_markdown="# Example study\n\nFixed protocol.",
-    operation_id="pretrain-baseline-seed0-attempt-1",
-    markdown="## Completed\n\nHeadline metrics and provenance.",
-    terminal=TerminalLogIdentity("example", "pretrain-baseline-seed0", 1),
-)
-```
-
-The helper stores internal HTML-comment metadata with each complete Markdown block. Replaying the same operation or terminal attempt returns `False` without changing the file. Reusing an operation ID with different content fails validation. Terminal deduplication uses `study_id`, `run_id`, and `attempt`, so separate attempts remain separate even when their phase or event ID matches.
-
-## Run a persistent Codex app-server daemon
-
-Repository code requires an existing daemon. It never starts, restarts, or stops app-server. The operator owns daemon lifecycle and authentication.
-
-With Codex CLI 0.146.0 or later, start and inspect the managed local daemon outside this repository:
-
-```bash
-codex app-server daemon start
-codex app-server daemon version
-```
-
-The implementation baseline is the schema-conforming Codex 0.146.0 app-server.
-Missing fields, null permission profiles, old response shapes, and old state
-contracts are rejected rather than inferred. Review the current
-[Codex App Server documentation](https://learn.chatgpt.com/docs/app-server.md)
-before changing the client.
-
-## Deliver through the daemon Unix socket
-
-The shared runtime connects to the daemon's local Unix socket and discovers it
-through `codex app-server daemon version` by default:
-
-```bash
-uv run python scripts/research.py notify-worker --once \
-  --root logs/research
-```
-
-Use `--socket /absolute/path/to/app-server.sock` to select a non-default daemon
-socket. Do not expose an unauthenticated app-server listener on a shared or
-public network.
-
-## CLI behavior
-
-Register an exact worker root or validate its existing marker:
-
-```bash
-uv run python scripts/research.py register-root --root <path>
-```
-
-Inspect, reconstruct, or explicitly requeue one run:
-
-```bash
-uv run python scripts/research.py notify <study.yaml> <run-id>
-uv run python scripts/research.py notify <study.yaml> <run-id> --requeue
-```
-
-Process each due current event at most once:
-
-```bash
-uv run python scripts/research.py notify-worker --once \
-  [--root logs/research] \
-  [--socket PATH]
-```
-
-All commands support `--format text|json`, `--color auto|always|never`, `--no-color`, and mutually exclusive `--quiet` or `--verbose`. Primary text or JSON goes to stdout. Warnings and diagnostics go to stderr. JSON is deterministic and never contains ANSI color.
-
-Exit codes are:
-
-| Code | Meaning |
-| ---: | --- |
-| `0` | The command succeeded. For a worker sweep, every due event was accepted. |
-| `1` | Validation or delivery problems remain, including a scheduled retry or failed event. |
-| `2` | The invocation is invalid, or the CLI encountered a runtime or I/O failure. |
-
-`notify` is a state acknowledgement interface. It can reconstruct a missing
-notification and explicitly requeue a `blocked` event, but it cannot record
-app-server acceptance. Only `notify-worker` writes `accepted` after a successful
-delivery or history reconciliation.
-
-## Delivery lifecycle
-
-The shared state machine uses `pending`, `in_flight`, `uncertain`, `retry_due`,
-`accepted`, and `blocked`. The event ID is also the
-`clientUserMessageId`. Request boundaries are durable before transport writes,
-and an uncertain acknowledgement is reconciled against complete task history
-before any resend. Backoff starts at 5 seconds, doubles per attempt, caps at 300
-seconds, and uses full jitter.
-
-`research_compatibility` is the package and worker default. It starts an idle
-root task or steers the exact active turn. `strict` is an explicit opt-in that
-blocks idle starts and owned goal reactivation. The idle read and start are not
-atomic because Codex 0.146.0 has no atomic idle-start precondition.
-
-After a controller is durably armed, enter notify wait when the goal is active,
-the goal API permits blocking, and no implementation, analysis, state
-transition, or other immediate work remains. The shared `enter_notify_wait()`
-records the goal identity and acknowledged blocked `updatedAt`. Delivery may
-reactivate only that exact owned lease. A blocked goal without the lease, with
-changed metadata, or with an uncertain transition is treated as manually
-blocked and remains untouched.
-
-Goal reads and writes are also non-atomic because Codex 0.146.0 has no
-compare-and-set operation. Exact `createdAt`, objective hash, token budget, and
-`updatedAt` checks detect changes around the race but cannot close it.
-
-The wake message contains only validated identifiers, terminal status, and the absolute `terminal.json` path:
-
-```text
-Research run completed.
-Study: <study-id>
-Run: <run-id>
-Status: <terminal-status>
-Terminal state: <absolute-terminal-json-path>
-
-Inspect the terminal state and continue the study protocol.
-```
-
-Raw logs, stack traces, error text, model output, and training output never enter the prompt.
-
-## Event-driven wakeups and scheduled fallback
-
-Prefer a host controller or local non-model watcher that invokes the one-shot
-worker after `notification.json` is durable. Do not keep a ChatGPT or Codex turn
-open to sleep or poll terminal files. The watcher must not change terminal
-training state or make training wait for Codex.
-
-The generic template implements terminal events and leaves trainer and
-supervisor mechanics to the domain adapter. Long-running adapters should add
-one-shot lifecycle records for the first recovery-confirming
-train-validation-checkpoint cycle, supervisor loss without terminal state, and
-trainer-progress stalls. Drive their controller from durable file events,
-process-exit handles, and explicit progress deadlines. Routine progress,
-heartbeats, notification retries, and acceptance writes must not wake Codex or
-retrigger delivery. After a transient transport failure, keep the event queued
-and add the earliest durable `next_attempt_at` to the controller's local selector
-or timer. Run one notification sweep at that deadline and recompute it from
-persisted state. This does not spend a model turn or poll the filesystem. A
-retrying event must not block a fresh due event, and socket replacement may
-trigger an immediate sweep. Persist controller startup, sweep outcomes, isolated
-problems, and shutdown or failure in a local log.
-
-When an event source is unavailable, a scheduled task can run the worker as a
-sparse fallback:
-
-```bash
-uv run python scripts/research.py notify-worker --once --root logs/research
-```
-
-Create and own that schedule in the ChatGPT desktop app. GPT-5.6 Luna with
-medium reasoning is appropriate for a read-only scheduled check, dedicated
-relay task, model-selectable subagent, or other low-value non-mutating work.
-Such a relay may inspect durable evidence and send a concise message to the root
-agent. The root model retains launches, recovery, goal changes, scientific
-decisions, and code changes.
-
-Root delivery never includes `model` or `effort` in `turn/start`; Codex 0.146.0
-persists root start overrides into later turns. `turn/steer` retains the active
-turn's model. Agent-mail wake behavior may optimize a relay when supported, but
-direct root delivery remains the correctness path. Keep the computer on, the
-app running, and the repository available. This template does not create or
-modify schedules.
-
-Usage reporting is opportunistic. During an existing monitoring, terminal, or
-handoff report, sample current Codex rate-limit telemetry once when available
-and include the observation time, used and remaining percentages, reset time,
-and change from the prior report. Do not create a separate scheduled task, wake,
-wait, or polling loop for usage alone. The sample does not count as a research
-monitoring check.
-
-Token-use limits apply only to intervals spent polling or inspecting live
-experiment state. Exclude initial setup, implementation, tests, benchmarks,
-preflight, launch preparation and execution, result analysis, summaries, Git
-work, and any code or configuration changes required during a study. Capture
-token totals at the start and end of each monitoring interval when available.
-If an interval cannot be isolated, report it as unmeasured instead of using the
-aggregate goal or task total. Only the monitoring-only counter can trigger an
-excess-use stop or block.
-
-Primary-repository Git work has standing authorization for non-destructive
-study branches, commits, fetches, and pushes to non-protected branches. Tandem
-repositories may be branched and committed locally without another permission
-request; a clean exact-SHA local commit is sufficient provenance, but its push
-requires explicit permission. Pull requests, protected-branch pushes, history
-rewrites, tags, and destructive operations remain separately controlled.
-
-W&B online operations have standing authorization for declared non-sensitive
-research metrics, configs, and provenance. Scientific studies should track
-online. Keep exact destinations and per-operation manifests as provenance and
-data-boundary checks, and fail preflight instead of silently launching offline
-when they are incomplete. Reserve offline mode for explicit fallback tests or
-recorded tracker outages.
-
-When an authorized pull request includes terminal comparative results, refresh
-its body after pushing the result commit. Add a `## Findings` table generated
-from the committed structured summary with every evaluated variant or
-preregistered aggregate, key hyperparameters, primary and convergence metrics,
-per-run wall time or another predefined resource measure, and promotion
-decision. Report total study wall span and summed run time or compute cost
-separately, mark censored results, and distinguish active from wall time and
-nominal from effective hyperparameters. Omit this section for protocol-only
-changes and studies that are still active.
-
-## Security and failure boundaries
-
-- Treat study YAML, persisted JSON, file paths, app-server messages, and daemon errors as untrusted input.
-- Validate the exact managed-root marker before recursive notification discovery. Do not infer ownership from an existing directory or its contents.
-- Keep the daemon and Unix socket local. Apply filesystem permissions appropriate to the host.
-- Never put secrets, raw samples, logs, stack traces, or training output in a wake prompt.
-- Never let notification delivery change a terminal training result.
-- Never let the training process wait for Codex availability.
-- Use fake Unix-socket servers in tests. Automated tests must not resume, steer, or wake a real Codex task.
-- Do not add daemon lifecycle management to the training process, supervisor, or notification worker.
-
-## Downstream adapter contract
-
-The generic package does not implement training, external trackers, process supervision, or monitoring schedules. A downstream adapter must implement these protocol rules:
-
-- Declare an emitted-data-class manifest for each W&B operation, including launch, summary, backfill, configuration, and provenance. Use the standing online authorization only with an exact destination and declared non-sensitive classes; reject incomplete scientific-study declarations instead of silently falling back to local-only mode, and record requested and effective modes.
-- Require the primary repository to be clean and pushed at its recorded SHA. Permit clean unpushed tandem repositories when their local commit, dependency pin, and frozen imported source match that SHA exactly.
-- Own the child process group after spawn. On heartbeat or state-write failure, cancellation, interrupt, or another exceptional exit, terminate the group, escalate when required, and reap every child before releasing GPU or other resource locks.
-- Change a run's polling counter and `next_check_at` only when that run is due. A wake for a terminal run clears only that run's poll and leaves every unrelated run's counters and schedule unchanged.
-- Use registered managed roots and `append_research_log` semantics for notification state and the shared study log.
-- Keep status, read-only monitoring, summary, and notification recovery usable without training-data mounts or launch-only environment variables. Validate those inputs at preflight or launch and name unresolved variables explicitly.
-
-## Development commands
-
-```bash
-make format            # rewrite Python formatting
-make lint              # Ruff lint checks
-make types             # Basedpyright
-make test              # full suite with branch coverage, minimum 90 percent
-make test-compat       # full suite without coverage for compatibility legs
-make test-notify-loop  # focused fake-server sleep/wake/notify integration tests
-make audit             # hash-check registry deps; shared runtime is exact-SHA pinned
-make check             # all non-rewriting gates
-make package-check     # build one wheel and sdist, then import the wheel
-```
-
-## Canonical autoresearch skill
-
-The maintained skill is `.agents/skills/autoresearch/` in this repository. Use it for experiment planning, launch, recovery, monitoring, comparison, and notification handling. Copy that directory into downstream repositories so each project carries the contract it implements:
-
-```bash
-mkdir -p /path/to/downstream/.agents/skills/autoresearch
-cp -R .agents/skills/autoresearch/. \
-  /path/to/downstream/.agents/skills/autoresearch/
-```
-
-Synchronize downstream copies from this repository and validate the result with:
-
-```bash
-uv run python "${CODEX_HOME:-${HOME}/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" \
-  .agents/skills/autoresearch
-```
-
-The separately installed `~/.codex/skills/autoresearch` copy is deprecated. Do not edit it as a source. Remove it only after every consumer uses a repository copy or another installation synchronized from this canonical directory.
+`make check` validates the shared source link, formatting, Ruff, Basedpyright, core tests
+with at least 90 percent branch coverage, and dependency advisories. `make test-pytorch`
+enforces a separate 90 percent branch-coverage gate for the optional adapters and runs a
+two-process Gloo test. CI adds a required hosted `PyTorch / Python 3.14` job and includes
+it in the stable `Required` aggregate.
+
+## Create a downstream project
+
+1. Rename `project/` and update its imports.
+2. Change the distribution name in `pyproject.toml` and the package smoke test.
+3. Replace the example study definition.
+4. Implement the real model and data-loader factory behind `TrainingComponents`.
+5. Define explicit resource limits, attention predicates, emitted-data manifests, and
+   promotion rules.
+6. Keep the shared skills gitlink and runtime pin exact and synchronized.
+7. Run every validation gate before publication.

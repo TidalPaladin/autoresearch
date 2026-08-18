@@ -4,20 +4,56 @@ import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from project.research.runtime import (
     StudyConfig,
+    persist_notification_plan,
+    persist_wake_context,
+    queue_terminal_notification,
     read_notification_event,
     record_terminal_event,
     register_managed_root,
     write_notification_event,
 )
+from project.research.wake_context import WakeContext
 from scripts.research import resolve_daemon_socket
 
 THREAD_ID = "019f8098-aa66-7011-bc23-c3b3a78f7501"
+OCCURRED_AT = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+OPERATION_STARTED_AT = OCCURRED_AT - timedelta(seconds=601)
+
+
+def prepare_notification(study: StudyConfig, run_id: str):
+    context = WakeContext(
+        thread_id=THREAD_ID,
+        permission_profile=":danger-full-access",
+        approval_policy="never",
+        captured_at=OPERATION_STARTED_AT,
+        goal_snapshot=None,
+    )
+    persist_wake_context(study, run_id, context)
+    persist_notification_plan(
+        study,
+        run_id,
+        operation_started_at=OPERATION_STARTED_AT,
+        expected_runtime_seconds=601,
+        estimate_basis="test estimate",
+    )
+    terminal = record_terminal_event(
+        study,
+        run_id,
+        attempt=1,
+        status="completed",
+        operation_started_at=OPERATION_STARTED_AT,
+        occurred_at=OCCURRED_AT,
+        elapsed_basis="operation",
+        originating_thread_id=THREAD_ID,
+    )
+    return terminal, queue_terminal_notification(terminal, context)
 
 
 def test_daemon_socket_resolution_prefers_explicit_path(tmp_path: Path) -> None:
@@ -65,13 +101,7 @@ def study_file(tmp_path: Path) -> Path:
 
 def test_notify_recovers_missing_notification_as_json(study_file: Path, tmp_path: Path) -> None:
     study = StudyConfig.load(study_file)
-    terminal, _ = record_terminal_event(
-        study,
-        "run-a",
-        attempt=1,
-        status="completed",
-        originating_thread_id=THREAD_ID,
-    )
+    terminal, _ = prepare_notification(study, "run-a")
     Path(terminal.terminal_state_path).with_name("notification.json").unlink()
 
     result = run_cli(tmp_path, "notify", str(study_file), "run-a", "--format", "json")
@@ -85,13 +115,7 @@ def test_notify_recovers_missing_notification_as_json(study_file: Path, tmp_path
 
 def test_notify_text_is_pipe_safe_and_has_no_color(study_file: Path, tmp_path: Path) -> None:
     study = StudyConfig.load(study_file)
-    record_terminal_event(
-        study,
-        "run-a",
-        attempt=1,
-        status="completed",
-        originating_thread_id=THREAD_ID,
-    )
+    prepare_notification(study, "run-a")
 
     result = run_cli(tmp_path, "notify", str(study_file), "run-a")
 
@@ -118,13 +142,7 @@ def test_quiet_and_verbose_are_mutually_exclusive(study_file: Path, tmp_path: Pa
 
 def test_no_color_overrides_always(study_file: Path, tmp_path: Path) -> None:
     study = StudyConfig.load(study_file)
-    record_terminal_event(
-        study,
-        "run-a",
-        attempt=1,
-        status="completed",
-        originating_thread_id=THREAD_ID,
-    )
+    prepare_notification(study, "run-a")
     result = run_cli(
         tmp_path,
         "notify",
@@ -222,13 +240,7 @@ def test_worker_delivery_problem_uses_exit_one_and_clean_json(tmp_path: Path) ->
 
 def test_notify_requeues_failed_event(study_file: Path, tmp_path: Path) -> None:
     study = StudyConfig.load(study_file)
-    _, event = record_terminal_event(
-        study,
-        "run-a",
-        attempt=1,
-        status="completed",
-        originating_thread_id=THREAD_ID,
-    )
+    _, event = prepare_notification(study, "run-a")
     failed = event.with_delivery_failure(
         attempted_at=event.occurred_at,
         error="exhausted",
@@ -315,3 +327,39 @@ def test_register_root_rejects_repository_root_with_exit_one(tmp_path: Path) -> 
     assert result.returncode == 1
     assert result.stdout == ""
     assert "repository root" in result.stderr
+
+
+def test_cutover_inventory_reports_fixed_manifest_path_without_writing(tmp_path: Path) -> None:
+    root = tmp_path / "logs"
+    register_managed_root(root)
+    legacy = root / ".notify-wake" / "v1" / "event.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("{}\n", encoding="utf-8")
+
+    result = run_cli(
+        tmp_path,
+        "cutover-inventory",
+        "--root",
+        str(root),
+        "--format",
+        "json",
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["file_count"] == 1
+    assert payload["manifest_written"] is False
+    assert payload["manifest_path"] == str(root / ".notify-wake" / "v2" / "cutover-manifest.json")
+    assert not Path(payload["manifest_path"]).exists()
+
+
+def test_cutover_inventory_requires_source_commit_for_manifest(tmp_path: Path) -> None:
+    result = run_cli(
+        tmp_path,
+        "cutover-inventory",
+        "--root",
+        str(tmp_path / "logs"),
+        "--write-manifest",
+    )
+    assert result.returncode == 2
+    assert "--source-commit is required" in result.stderr

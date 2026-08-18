@@ -11,16 +11,38 @@ Run empirical studies as controlled, recoverable experiments. Treat every result
 
 Preserve the user's scope and authority:
 
+- Treat a manual `$autoresearch` invocation as permission for the current task
+  to inspect persistent-goal state, enable Goal Mode when needed, and perform
+  the standing-authorized study operations below. Do not infer this permission
+  from implicit skill selection or repository instructions alone.
 - Read and inspect within the repository and declared experiment environment.
 - Modify code, configuration, state, logs, and managed artifacts only within the study scope.
 - Treat normal non-destructive Git operations in the primary repository as standing-authorized. Create or switch study branches, stage, commit, fetch, and push non-protected branches without asking again.
 - Treat local Git operations in tandem repositories as standing-authorized. Create branches and commits locally, and accept a clean exact-SHA local commit as sufficient provenance. Do not push a tandem repository without explicit permission.
 - Treat online W&B operations as standing-authorized for a declared research destination and declared non-sensitive data classes. Track experiments online by default.
-- Do not delete artifacts, rewrite history, push protected branches, open pull requests, publish through a non-W&B service, alter production systems, or exceed recorded resource limits without the corresponding authorization.
-- Escalate when a decision would change the study design, resource use, retention policy, or authorized scope.
+- Do not delete artifacts, rewrite history, push protected branches, open pull requests, push tandem repositories, publish through a non-W&B service, alter production systems, change scheduled tasks, or exceed recorded resource limits without the corresponding authorization.
+- Do not silently change the study design, resource use, retention policy, or authorized scope. Finish independent authorized work before requesting a decision that remains necessary.
 - Do not treat invocation of this skill as authorization for destructive retention or GitHub-side operations.
 
-Allow planning and recovery without an active persistent goal. Before launching any experiment, require an active goal whose completion criteria cover the study. If none is active, stop before launch and ask the user to start one.
+Prefer an authorized, reversible path over a permission request whenever it
+preserves the study protocol and recorded limits. Keep tandem-repository work
+at a local exact-SHA commit instead of pushing it, use a non-protected study
+branch instead of a protected branch, leave a validated branch ready instead
+of opening a pull request, and retain artifacts instead of deleting them.
+Record the selected fallback and any limitation it introduces. Request
+permission only when no authorized alternative can achieve a required study
+outcome, and report the exact blocked action after completing all independent
+work.
+
+Allow planning and recovery without an active persistent goal. Before
+launching any experiment, call `get_goal` and require an active goal whose
+completion criteria cover the study. Retain a compatible unfinished goal. When
+no unfinished goal exists, call `create_goal` with the study outcome,
+constraints, and verification criteria; the manual invocation authorizes this
+step without another confirmation. Never replace an unrelated unfinished goal.
+If goal tools are unavailable or an existing goal is incompatible, complete
+all safe planning, recovery, and local preparation before reporting launch as
+blocked.
 
 Use a repository's research skill or domain adapter for commands, configuration, datasets, metrics, training, evaluation, schedulers, hardware, checkpoints, and notifications. Do not invent missing domain mechanics.
 

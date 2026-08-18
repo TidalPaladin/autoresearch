@@ -54,6 +54,9 @@ exclude = [
     "**/__pycache__",
     "**/.pytest_cache",
     "**/_version.py",
+    # The optional adapter gate type-checks these with the PyTorch extra installed.
+    "scripts/synthetic_classification.py",
+    "tests/test_pytorch_adapter.py",
 ]
 pythonVersion = "3.12"
 pythonPlatform = "Linux"

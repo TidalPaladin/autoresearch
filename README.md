@@ -288,9 +288,9 @@ git diff --check
 
 `make check` validates the shared source link, formatting, Ruff, Basedpyright, core tests
 with at least 90 percent branch coverage, and dependency advisories. `make test-pytorch`
-enforces a separate 90 percent branch-coverage gate for the optional adapters and runs a
-two-process Gloo test. CI adds a required hosted `PyTorch / Python 3.14` job and includes
-it in the stable `Required` aggregate.
+type-checks the optional entry points, enforces a separate 90 percent branch-coverage
+gate for the optional adapters, and runs a two-process Gloo test. CI adds a required
+hosted `PyTorch / Python 3.14` job and includes it in the stable `Required` aggregate.
 
 ## Create a downstream project
 

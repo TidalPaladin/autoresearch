@@ -1,4 +1,4 @@
-.PHONY: audit check clean clean-env cuda-smoke format format-check init lint package-check source-link-check test test-% test-compat test-notify-loop test-pytorch types update
+.PHONY: audit check clean clean-env cuda-smoke format format-check init lint package-check source-link-check test test-% test-compat test-notify-loop test-pytorch types types-pytorch update
 
 SOURCES = project scripts tests
 UV = uv
@@ -15,6 +15,16 @@ lint: ## run Ruff lint checks
 
 types: ## run Basedpyright type checking
 	$(UV) run --frozen basedpyright
+
+types-pytorch: ## type-check the optional PyTorch and W&B adapter entry points
+	$(UV) run --frozen --extra pytorch --extra wandb basedpyright \
+		project/research/pytorch.py \
+		project/research/supervisor.py \
+		project/research/wandb_tracking.py \
+		scripts/synthetic_classification.py \
+		tests/test_pytorch_adapter.py \
+		tests/test_torch_supervisor.py \
+		tests/test_wandb_tracker.py
 
 test: ## run tests with branch coverage and the 90 percent threshold
 	$(UV) run --frozen pytest \
@@ -37,6 +47,7 @@ test-notify-loop: ## run the subscription-free notification-loop integration tes
 	$(UV) run --frozen pytest tests/test_notify_loop.py
 
 test-pytorch: ## run the optional PyTorch, DDP, supervisor, and W&B adapter tests
+	$(MAKE) types-pytorch
 	$(UV) run --frozen --extra pytorch --extra wandb pytest \
 		--cov-config=/dev/null \
 		--cov-branch \
